@@ -1,3 +1,6 @@
+#!/usr/bin/env node
+"use strict";
+
 const child_process = require("node:child_process");
 const fs = require("node:fs/promises");
 const Path = require("node:path");

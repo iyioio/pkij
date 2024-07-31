@@ -1,10 +1,14 @@
 # pkij
-A CLI tool for injecting packages into a mono repo. Pkij allows you to inject packages locations outside of the
-root of your mono repo while keeping file in sync with the source location. This is very useful 
-when developing library packages as it allows you to keep the code for library packages in a 
+A CLI tool for injecting packages into a mono repo. Pkij allows you to inject packages located
+outside of the root of a mono repo while keeping file in sync with the source location. This is very
+useful when developing library packages as it allows you to keep the code for library packages in a 
 separate git repo while you test the package in other repos without the need to continuously 
 publish NPM updates.
 
+## Install
+``` sh
+npm install -g @iyio/pkij
+```
 
 ## CLI Arguments
 
