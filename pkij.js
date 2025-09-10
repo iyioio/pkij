@@ -19,6 +19,7 @@ const Path = require("node:path");
  * @prop {string|undefined} indexPath relative path to a index.ts or index.js file. Default = "src/index.ts"
  * @prop {Record<string,any>} packageJson Package json
  * @prop {string[]} deps Direct package dependencies
+ * @prop {string[]|undefined} assets - markdown files and images
  * @prop {Config|undefined} config additional configuration
  *
  * @typedef Config
@@ -133,9 +134,6 @@ const main=async ()=>{
                         buildPaths.push(d);
                     }
                 }
-                break;
-            case '--build-no-swc':
-                buildUseSwc=false;
                 break;
 
             case '--build-peer-internal-only':
@@ -517,7 +515,7 @@ const populatePkgAsync=async (pkg)=>{
  * @param {Pkg} pkg
  */
 const populatePkgDepsAsync=async (pkg)=>{
-    const deps=await getPackagesDeps(pkg);
+    const {deps,assets}=await scanPackageAsync(pkg);
 
     const packageJson={...pkg.packageJson}
     for(const name of deps){
@@ -539,6 +537,7 @@ const populatePkgDepsAsync=async (pkg)=>{
     }
     pkg.packageJson=packageJson;
     pkg.deps=deps;
+    pkg.assets=assets;
 }
 
 /**
@@ -1100,6 +1099,14 @@ const formatImportName=(name)=>{
     return parts.length===1?parts[0]:parts[0].startsWith('@')?parts[0]+'/'+parts[1]:parts[0];
 }
 
+const assetsExtensions=[
+    'md',
+    'png',
+    'jpg',
+    'jpeg',
+    'gif',
+]
+
 /**
  * @param {string} content
  * @param {RegExp} reg
@@ -1121,25 +1128,38 @@ const findDeps=(content,reg,matchI,deps)=>{
  * Builds a package
  * @param {string} tsConfig
  * @param {Pkg} pkg
- * @returns {Promise<string[]>}
+ * @returns {Promise<{deps:string[],assets:string[]}>}
  */
-const getPackagesDeps=async (pkg)=>{
+const scanPackageAsync=async (pkg)=>{
 
     const deps=[];
+    const assets=[];
 
     await scanDirAsync(pkg.dest,pkg.dir,async (name,destPath,srcPath,isDir)=>{
-        if(isDir || !tsReg.test(name) || name.includes('.spec.')){
+        if(isDir){
             return;
         }
-        const file=await loadTextAsync(srcPath);
-        findDeps(file,importReg,2,deps);
-        findDeps(file,requireReg,2,deps);
+
+
+        if(tsReg.test(name) && !name.includes('.spec.')){
+            const file=await loadTextAsync(srcPath);
+            findDeps(file,importReg,2,deps);
+            findDeps(file,requireReg,2,deps);
+        }
+
+        const e=name.lastIndexOf('.');
+        const ext=e===-1?'':name.substring(e+1);
+
+        if(assetsExtensions.includes(ext)){
+            assets.push(srcPath);
+        }
 
     });
 
     deps.sort();
+    assets.sort();
 
-    return deps;
+    return {deps,assets};
 }
 
 /**
@@ -1163,9 +1183,12 @@ const buildPackageAsync=async (pkg)=>{
 
     await buildEsPackageAsync({tsConfigPath,pkg,tsConfig});
 
-    const outDir=Path.join(
+    const outBaseDir=Path.join(
         pkg.dir,
-        tsConfig?.compilerOptions?.outDir??'../../dist',
+        tsConfig?.compilerOptions?.outDir??'../../dist'
+    );
+    const outDir=Path.join(
+        outBaseDir,
         pkg.dir,
     );
 
@@ -1177,6 +1200,7 @@ const buildPackageAsync=async (pkg)=>{
     await Promise.all([
         fs.writeFile(Path.join(outDir,'package.json'),JSON.stringify(packageJson,null,4)),
         fs.writeFile(Path.join(outDir,'src/package.json'),'{"sideEffects":false}'),
+        ...(pkg.assets?.map(a=>fs.copyFile(a,Path.join(outBaseDir,a)))??[])
     ]);
 }
 
@@ -1188,7 +1212,6 @@ const buildPackageAsync=async (pkg)=>{
  * @prop {Record<string,any>} tsConfig tsconfig contents
  */
 
-let buildUseSwc=true;
 /**
  * Builds a package
  * @param {EsBuildOptions} options
@@ -1199,32 +1222,14 @@ const buildEsPackageAsync=async ({tsConfigPath,pkg,outSuffix,tsConfig})=>{
     let start=Date.now();
     
     try{
-        if(buildUseSwc){
-
-            
-            const swcConfigDir=Path.join(outDir,'.swc',pkg.dir);
-            const swcConfig=Path.join(swcConfigDir,'swc-config.json');
-            const [exists]=await Promise.all([
-                existsAsync(Path.join(pkg.dir,swcConfig)),
-                fs.mkdir(Path.join(pkg.dir,swcConfigDir),{recursive:true}),
-            ]);
-            await spawnAsync({
-                cwd:pkg.dir,
-                cmd:(
-                    (exists?'':`npx tsconfig-to-swcconfig -f './${Path.basename(tsConfigPath)}' -o '${swcConfig}' && `)+
-                    `npx swc src --config-file '${swcConfig}' --out-dir '${Path.join(outDir,pkg.dir)}'`
-                ),
-            })
-        }else{
-            await spawnAsync({
-                cwd:pkg.dir,
-                cmd:(
-                    `npx tsc --project '${Path.basename(tsConfigPath)}'`
-                ),
-                stderr:console.error,
-                stdout:console.log
-            })
-        }
+        await spawnAsync({
+            cwd:pkg.dir,
+            cmd:(
+                `npx tsc --project '${Path.basename(tsConfigPath)}'`
+            ),
+            stderr:console.error,
+            stdout:console.log
+        })
 
         console.log(`${pkg.dir} complete - ${(Date.now()-start).toLocaleString()}ms`)
     }catch(ex){
@@ -1245,7 +1250,6 @@ const showUsage=()=>{
                                 If no paths are provided a default value of "pkij-config.json" is used.
 
 --build         [path ...]      Builds a package
---build-no-swc                  Disables using swc
 
 --dry-run
 --dryRun                        If present a dry run is preformed and no changes to the filesystem is made
