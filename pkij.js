@@ -17,9 +17,19 @@ const Path = require("node:path");
  * @prop {boolean|undefined} isNpmDevDep If true the package is a dev dependency
  * @prop {string|undefined} installedNpmVersion The installed npm version of the package
  * @prop {string|undefined} indexPath relative path to a index.ts or index.js file. Default = "src/index.ts"
+ * @prop {Record<string,any>} packageJson Package json
+ * @prop {string[]} deps Direct package dependencies
+ * @prop {Config|undefined} config additional configuration
  *
  * @typedef Config
- * @prop {Pkg[]} packages
+ * @prop {'lib'|'nextjs'|'cdk'|'test'|undefined} type
+ * @prop {Pkg[]|undefined} packages
+ * @prop {string[]|undefined} ignore
+ * @prop {BuildConfig|undefined} build
+ * @prop {boolean|undefined} disabled
+ *
+ * @typedef BuildConfig
+ * @prop {boolean|undefined} disabled
  */
 
 const mergePkgProps=['isNpmDevDep','installedNpmVersion'];
@@ -32,11 +42,14 @@ let linkMode='hard-link';
 const linkModes=['hard-link','sym-link','copy'];
 
 /** @type {string[]} */
-const ignoreList=['.DS_Store','node_modules'];
+const ignoreList=['.DS_Store','node_modules','venv','__pycache__','.convo-make','.next','dist'];
 
 let gitIgnoreFile='.gitignore';
 let tsConfigFile='tsconfig.base.json';
 let packageJsonFile='package.json';
+let buildPeerInternalOnly=false;
+
+let updateImports=null;
 
 let packageJsonFileChanged=false;
 let verbose=false;
@@ -109,6 +122,30 @@ const main=async ()=>{
                     }
                 }else{
                     await addToAsync(eject,'pkij-config.json');
+                }
+                break;
+
+            case '--build':
+                hasAction=true;
+                const dirs=nextAll.length?nextAll.map(d=>(!d.includes('/') && !d.includes('\\'))?'packages/'+d:d):await getBuildPackagePathsAsync();
+                for(const d of dirs){
+                    if(!buildPaths.includes(d)){
+                        buildPaths.push(d);
+                    }
+                }
+                break;
+            case '--build-no-swc':
+                buildUseSwc=false;
+                break;
+
+            case '--build-peer-internal-only':
+                buildPeerInternalOnly=true;
+                break;
+
+            case '--update-imports':
+                if(next){
+                    updateImports=next;
+                    hasAction=true;
                 }
                 break;
 
@@ -189,6 +226,7 @@ const main=async ()=>{
         tsConfigFile,
         ignoreList,
         skipNpmInstall,
+        buildPaths,
     })
 
     for(const absPath in inject){
@@ -197,6 +235,14 @@ const main=async ()=>{
 
     for(const absPath in eject){
         await ejectAsync(eject[absPath]);
+    }
+
+    if(buildPaths.length){
+        await buildAsync();
+    }
+
+    if(updateImports){
+        await updateImportsAsync(updateImports);
     }
 
     if(packageJsonFileChanged && !skipNpmInstall){
@@ -240,6 +286,135 @@ const execAsync=(
 }
 
 
+/**
+ * @typedef SpawnOptions
+ * @prop {string} cmd
+ * @prop {string|undefined} cwd
+ * @prop {(value:string)=>void|undefined} out
+ * @prop {string|undefined} outPrefix
+ * @prop {boolean|undefined} silent
+ * @prop {boolean|undefined} throwOnError
+ * @prop {((...value:string[])=>void)|undefined} stdout
+ * @prop {((...value:string[])=>void)|undefined} stderr
+ * @prop {((proc:ChildProcess)=>void)|undefined} onChild
+ * @prop {((type:string,value:string)=>void)|undefined} onOutput
+ * @prop {((type:string,value:string)=>void)|undefined} onError
+ * @prop {((code:number)=>void)|undefined} onExit
+ * @prop {CancelToken|undefined} cancel
+ * @prop {boolean|undefined} logPid
+ */
+
+
+/**
+ * Executes a shell command and returns its output
+ * @param {SpawnOptions} options
+ * @returns {Promise<string>}
+ */
+const spawnAsync=(
+    options
+)=>{
+    const {
+        cmd,
+        cwd,
+        out,
+        silent,
+        stdout,
+        stderr,
+        onChild,
+        onOutput,
+        onError,
+        outPrefix='',
+        throwOnError=true,
+        onExit,
+        cancel,
+        logPid,
+    }=options;
+
+    return new Promise((r,j)=>{
+
+        let child=undefined;
+        const outData=[];
+
+        try{
+            child=child_process.spawn(cmd,{cwd,shell:true});
+            if(logPid){
+                if(!silent){
+                    stdout?.(`pid(${child.pid}) > `+cmd);
+                }
+                out?.(`pid(${child.pid}) > `+cmd)
+            }else{
+                if(!silent){
+                    stdout?.('> '+cmd);
+                }
+                out?.('> '+cmd)
+            }
+        }finally{
+            if(!child){
+                if(!silent){
+                    stdout?.('> '+cmd);
+                }
+                out?.('> '+cmd)
+            }
+        }
+        child.on('error',err=>{
+            if(throwOnError){
+                j(err);
+            }
+        });
+        child.on('exit',code=>{
+            if(logPid){
+                if(!silent){
+                    stdout?.(`pid(${child?.pid}) > # exit(${code}) -- `+cmd);
+                }
+                out?.(`pid(${child?.pid}) > # exit(${code}) -- `+cmd)
+            }
+            onExit?.(code??0);
+            if(code && throwOnError){
+                j(code);
+            }else{
+                r(outData.join());
+            }
+        });
+        child.on('disconnect',()=>r(outData.join()));
+        child.on('close',()=>r(outData.join()));
+        child.stdout.setEncoding('utf8');
+        child.stdout.on('data',(data)=>{
+                
+            if(typeof data !== 'string'){
+                data=data?.toString()??''
+            }
+            outData.push(data);
+            if(onOutput){
+                onOutput('out',data)
+            }
+            out?.(data);
+            if(!silent){
+                stdout?.(outPrefix?outPrefix+data:data);
+            }
+        });
+        child.stderr.setEncoding('utf8');
+        child.stderr.on('data',(data)=>{
+            if(typeof data !== 'string'){
+                data=data?.toString()??''
+            }
+            if(onError){
+                onError('err',data)
+            }
+            out?.(data);
+            stderr?.(outPrefix?outPrefix+data:data);
+        });
+        onChild?.(child);
+        cancel?.onCancelOrNextTick(()=>{
+            try{
+                child?.kill();
+            }catch{
+                // do nothing
+            }
+        });
+    })
+}
+
+
 
 /**
  * Get package info from either a config file path or package directory path
@@ -258,6 +433,9 @@ const getPkgsAsync=async (path)=>{
         if(stat.isFile()){
             /** @type {Config} */
             const config=await loadJsonAsync(path);
+            if(config.ignore){
+                ignoreList.push(...config.ignore);
+            }
             for(const pkg of config.packages){
                 await populatePkgAsync(pkg);
                 pkgs.push(pkg);
@@ -314,6 +492,12 @@ const populatePkgAsync=async (pkg)=>{
         if((typeof packageJson.name === 'string') && !pkg.npmName){
             pkg.npmName=packageJson.name;
         }
+        pkg.packageJson=packageJson;
+    }
+    const configPath=Path.join(pkg.dir,'pkij-config.json');
+    if(await existsAsync(configPath)){
+        const configJson=await loadJsonAsync(configPath);
+        pkg.config=configJson;
     }
     if(!pkg.dest){
         pkg.dest=`packages/${Path.basename(pkg.dir)}`;
@@ -325,6 +509,36 @@ const populatePkgAsync=async (pkg)=>{
     if(pkg.npmName && !pkg.indexPath){
         pkg.indexPath='src/index.ts';
     }
+    
+}
+
+/**
+ * Populates the dependencies of a Pkg
+ * @param {Pkg} pkg
+ */
+const populatePkgDepsAsync=async (pkg)=>{
+    const deps=await getPackagesDeps(pkg);
+
+    const packageJson={...pkg.packageJson}
+    for(const name of deps){
+        const peer=buildPeerInternalOnly?((rootTsConfig?.compilerOptions?.paths?.[name] || rootBuildPackageJson?.peerDependencies?.[name])?true:false):true;
+        const depName=peer?'peerDependencies':'dependencies';
+        if(!packageJson[depName]){
+            packageJson[depName]={};
+        }
+        const localPeer=buildPkgs.find(p=>p.npmName===name);
+        const version=(
+            rootBuildPackageJson?.peerDependencies?.[name]??
+            rootBuildPackageJson?.dependencies?.[name]??
+            (localPeer?.packageJson?.version?'^'+localPeer.packageJson.version:null)??
+            null
+        )
+        if(version!==null){
+            packageJson[depName][name]=version;
+        }
+    }
+    pkg.packageJson=packageJson;
+    pkg.deps=deps;
 }
 
 /**
@@ -445,7 +659,7 @@ const isLinkedAsync=async (srcPath,destPath)=>{
  * @param {Pkg} pkg
  */
 const injectAsync=async (pkg)=>{
-    console.info('inject',pkg);
+    console.info('inject',verbose?pkg:`${pkg.dir} -> ${pkg.dest}`);
 
     const dirExists=await isDirAsync(pkg.dir);
     if(!dirExists){
@@ -767,6 +981,259 @@ const ejectAsync=async (pkg)=>{
 
 }
 
+const hasExtReg=/\.(js|jsx|ts|tsx|mjs|mts|cts|cjs)$/i;
+
+/**
+ * @param {string} path
+ */
+const updateImportsAsync=async (path)=>{
+    await scanDirAsync(path,path,async (name,destPath,srcPath,isDir)=>{
+        if(isDir || !tsReg.test(name)){
+            return;
+        }
+        let file=await loadTextAsync(srcPath);
+        file=file.replace(importReg,(_,_type,iName)=>{
+            if(!iName.startsWith('.') || hasExtReg.test(iName)){
+                return _;
+            }
+            console.log(srcPath,'->',_.replace(iName,iName+'.js'));
+            return _.replace(iName,iName+'.js');
+            
+        }).replace(requireReg,(_,type,iName)=>{
+            if(!iName.startsWith('.') || hasExtReg.test(iName)){
+                return _;
+            }
+            console.log(type,srcPath,'->',_.replace(iName,iName+'.js'));
+            return _.replace(iName,iName+'.js');
+        });
+        if(!dryRun){
+            await fs.writeFile(destPath,file);
+        }
+
+    });
+}
+
+/**
+ * @param {string} path
+ * @returns {string}
+ */
+const normPath=(path)=>{
+    return path.replace(/\\/g,'/');
+}
+
+/**
+ * package paths to build
+ * @type {string[]}
+ */
+const buildPaths=[];
+
+/**
+ * package paths to build
+ * @type {Pkg[]}
+ */
+const buildPkgs=[];
+let rootBuildPackageJson={};
+let rootTsConfig={};
+let buildDir='./'
+const buildAsync=async ()=>{
+
+    const startTime=Date.now();
+
+    rootBuildPackageJson=await loadJsonAsync('./package.json');
+    rootTsConfig=await loadJsonOrDefaultAsync('./tsconfig.base.json');
+    buildDir=normPath(process.cwd());
+    if(!buildDir.endsWith('/')){
+        buildDir+='/';
+    }
+
+    const dirs=await getBuildPackagePathsAsync();
+    await Promise.all(dirs.map(async path=>{
+        const pkg={dir:path}
+        await populatePkgAsync(pkg,true);
+        buildPkgs.push(pkg);
+    }));
+
+    await Promise.all(buildPkgs.map(pkg=>populatePkgDepsAsync(pkg)));
+
+    const max=1000;
+    const working=[];
+
+    const buildList=buildPkgs.filter(p=>buildPaths.includes(p.dir));
+    for(const pkg of buildList){
+        working.push(buildPackageAsync(pkg));
+
+        if(working.length>=max){
+            await Promise.all(working);
+            working.splice(0,working.length);
+        }
+    }
+
+    await Promise.all(working);
+
+    console.log(`Build complete in ${(Date.now()-startTime).toLocaleString()}ms`)
+}
+
+/**
+ * @returns {Promise<string[]>}
+ */
+const getBuildPackagePathsAsync=async ()=>{
+    const buildPaths=[];
+    const dirs=await fs.readdir('./packages',{withFileTypes:true});
+    for(const d of dirs){
+        if(d.isDirectory() && !ignoreList.includes(d.name)){
+            buildPaths.push(Path.join('packages',d.name));
+        }
+    }
+    return buildPaths;
+}
+
+const importReg=/(import|export[ \t]+\*)\s+.*?\s*from\s+['"]([^'"]+)['"]/gs;
+const requireReg=/\W(require|import)\s*\(\s*['"]([^'"]+)['"]\s*\)/gs;
+const tsReg=/\.tsx?/i
+
+/**
+ * @param {string} name
+ * @returns {string}
+ */
+const formatImportName=(name)=>{
+    const parts=name.split('/');
+    return parts.length===1?parts[0]:parts[0].startsWith('@')?parts[0]+'/'+parts[1]:parts[0];
+}
+
+/**
+ * @param {string} content
+ * @param {RegExp} reg
+ * @param {number} matchI
+ * @param {string[]} deps
+ */
+const findDeps=(content,reg,matchI,deps)=>{
+    content='\n'+content;
+    let match;
+    while(match=reg.exec(content)){
+        const name=formatImportName(match[matchI])
+        if(!name.startsWith('.') && !name.startsWith('@/') && !deps.includes(name)){
+            deps.push(name);
+        }
+    }
+}
+
+/**
+ * Builds a package
+ * @param {string} tsConfig
+ * @param {Pkg} pkg
+ * @returns {Promise<string[]>}
+ */
+const getPackagesDeps=async (pkg)=>{
+
+    const deps=[];
+
+    await scanDirAsync(pkg.dest,pkg.dir,async (name,destPath,srcPath,isDir)=>{
+        if(isDir || !tsReg.test(name) || name.includes('.spec.')){
+            return;
+        }
+        const file=await loadTextAsync(srcPath);
+        findDeps(file,importReg,2,deps);
+        findDeps(file,requireReg,2,deps);
+
+    });
+
+    deps.sort();
+
+    return deps;
+}
+
+/**
+ * Builds a package
+ * @param {Pkg} pkg
+ */
+const buildPackageAsync=async (pkg)=>{
+
+    if(pkg.config?.build?.disabled || pkg.config?.disabled || (pkg.config?.type??'lib')!=='lib'){
+        return;
+    }
+
+    const tsConfigPath=Path.join(pkg.dir,'tsconfig.json');
+
+    const tsConfigExists=await existsAsync(tsConfigPath);
+    if(!tsConfigExists){
+        return;
+    }
+
+    const tsConfig=await loadJsonAsync(tsConfigPath);
+
+    await buildEsPackageAsync({tsConfigPath,pkg,tsConfig});
+
+    const outDir=Path.join(
+        pkg.dir,
+        tsConfig?.compilerOptions?.outDir??'../../dist',
+        pkg.dir,
+    );
+
+    const packageJson={...pkg.packageJson}
+    if(!packageJson.main && await existsAsync(Path.join(outDir,'src/index.js'))){
+        packageJson.main='./src/index.js'
+    }
+
+    await Promise.all([
+        fs.writeFile(Path.join(outDir,'package.json'),JSON.stringify(packageJson,null,4)),
+        fs.writeFile(Path.join(outDir,'src/package.json'),'{"sideEffects":false}'),
+    ]);
+}
+
+/**
+ * @typedef EsBuildOptions
+ * @prop {string} tsConfigPath Location of tsconfig file
+ * @prop {string|undefined} outSuffix directory added to out path
+ * @prop {Pkg} pkg package to build
+ * @prop {Record<string,any>} tsConfig tsconfig contents
+ */
+
+let buildUseSwc=true;
+/**
+ * Builds a package
+ * @param {EsBuildOptions} options
+ */
+const buildEsPackageAsync=async ({tsConfigPath,pkg,outSuffix,tsConfig})=>{
+    console.log(`Build ${pkg.dir}`);
+    console.log(pkg);
+    let start=Date.now();
+    
+    try{
+        if(buildUseSwc){
+
+            
+            const swcConfigDir=Path.join(outDir,'.swc',pkg.dir);
+            const swcConfig=Path.join(swcConfigDir,'swc-config.json');
+            const [exists]=await Promise.all([
+                existsAsync(Path.join(pkg.dir,swcConfig)),
+                fs.mkdir(Path.join(pkg.dir,swcConfigDir),{recursive:true}),
+            ]);
+            await spawnAsync({
+                cwd:pkg.dir,
+                cmd:(
+                    (exists?'':`npx tsconfig-to-swcconfig -f './${Path.basename(tsConfigPath)}' -o '${swcConfig}' && `)+
+                    `npx swc src --config-file '${swcConfig}' --out-dir '${Path.join(outDir,pkg.dir)}'`
+                ),
+            })
+        }else{
+            await spawnAsync({
+                cwd:pkg.dir,
+                cmd:(
+                    `npx tsc --project '${Path.basename(tsConfigPath)}'`
+                ),
+                stderr:console.error,
+                stdout:console.log
+            })
+        }
+
+        console.log(`${pkg.dir} complete - ${(Date.now()-start).toLocaleString()}ms`)
+    }catch(ex){
+        console.error(`Failed to build ${pkg.dir}`,ex);
+        throw ex;
+    }
+
+}
+
 const showUsage=()=>{
     console.log(`Usage:
     
@@ -776,6 +1243,9 @@ const showUsage=()=>{
 
 --eject         [path ...]      List of package source config files or paths to package directories to eject.
                                 If no paths are provided a default value of "pkij-config.json" is used.
+
+--build         [path ...]      Builds a package
+--build-no-swc                  Disables using swc
 
 --dry-run
 --dryRun                        If present a dry run is preformed and no changes to the filesystem is made
