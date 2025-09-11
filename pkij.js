@@ -63,6 +63,8 @@ let verbose=false;
 let skipNpmInstall=false;
 let deleteUnlinked=false;
 
+let migrateNxTsConfig=false;
+
 
 const main=async ()=>{
 
@@ -165,6 +167,11 @@ const main=async ()=>{
                 }
                 break;
 
+            case '--migrate-nx-tsconfig':
+                migrateNxTsConfig=true;
+                hasAction=true;
+                break;
+
             case '--dry-run':
             case '--dryRun':
                 console.log('dry-run');
@@ -265,6 +272,10 @@ const main=async ()=>{
 
     if(updateImports){
         await updateImportsAsync(updateImports);
+    }
+
+    if(migrateNxTsConfig){
+        await migrateNxTsConfigAsync();
     }
 
     if(packageJsonFileChanged && !skipNpmInstall){
@@ -1093,6 +1104,52 @@ const ejectAsync=async (pkg)=>{
 
 }
 
+const tsConfigReg=/^tsconfig\./i;
+
+const migrateNxTsConfigAsync=async ()=>{
+    const defaultTsConfig=JSON.stringify({
+        extends:"../../tsconfig.base.json",
+        include:["src/**/*.ts","src/**/*.tsx"],
+        exclude:[
+            "jest.config.ts","src/**/*.spec.ts",
+            "src/**/*.test.ts","src/**/*.spec.tsx",
+            "src/**/*.test.tsx"
+        ]
+    },null,4);
+
+    const dirs=await fs.readdir('./packages',{withFileTypes:true});
+    for(const d of dirs){
+        if(!d.isDirectory()){
+            continue;
+        }
+
+        const dir=Path.join('./packages',d.name);
+
+        const files=await fs.readdir(dir,{withFileTypes:true});
+        let removed=false;
+        for(const file of files){
+            if(!file.isDirectory() && tsConfigReg.test(file.name)){
+                removed=true;
+                const filePath=Path.join(dir,file.name);
+                console.log(`rm ${filePath}`);
+                if(!dryRun){
+                    await fs.rm(filePath);
+                }
+            }
+        }
+        if(removed){
+            const tsPath=Path.join(dir,'tsconfig.json');
+            console.log(`write ${tsPath}`);
+            if(!dryRun){
+                await fs.writeFile(tsPath,defaultTsConfig);
+            }
+        }
+    }
+    
+    await loadBuildPackagesAsync();
+    await updateTsConfigsAsync();
+}
+
 const hasExtReg=/\.(js|jsx|ts|tsx|mjs|mts|cts|cjs)$/i;
 
 /**
@@ -1540,6 +1597,8 @@ const showUsage=()=>{
 --build-individual-packages     If present individual packages will be built with tsc instead of building all projects in a single pass
 
 --update-imports dir            Adds file extensions to all local inputs in the target directory
+
+--migrate-nx-tsconfig           Migrates tsconfig files used in NX projects
 
 --dry-run
 --dryRun                        If present a dry run is preformed and no changes to the filesystem is made
