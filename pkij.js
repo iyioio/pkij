@@ -22,7 +22,7 @@ const Path = require("node:path");
  * @prop {string|undefined} tsConfigPath Path to tsconfig file relative to root of project
  * @prop {string[]} deps Direct package dependencies
  * @prop {string[]} externalDeps external deps
- * @prop {string[]|undefined} assets - markdown files and images
+ * @prop {string[]|undefined} assets markdown files and images
  * @prop {Config|undefined} config additional configuration
  * @prop {string|undefined} binDir A directory where bin commands should be compiled from
  * @prop {boolean|undefined} disablePublish Disables NPM publishing
@@ -68,6 +68,7 @@ let deleteUnlinked=false;
 
 let migrateNxTsConfig=false;
 let publishPackages=false;
+let setVersion=undefined;
 
 
 const main=async ()=>{
@@ -180,6 +181,11 @@ const main=async ()=>{
                 }
                 break;
 
+            case '--set-version':
+                setVersion=next||'+0.0.1';
+                hasAction=true;
+                break;
+
             case '--migrate-nx-tsconfig':
                 migrateNxTsConfig=true;
                 hasAction=true;
@@ -289,6 +295,10 @@ const main=async ()=>{
 
     if(migrateNxTsConfig){
         await migrateNxTsConfigAsync();
+    }
+
+    if(setVersion){
+        await setVersionAsync(setVersion);
     }
 
     if(publishPackages){
@@ -1122,6 +1132,21 @@ const ejectAsync=async (pkg)=>{
 }
 
 /**
+ * 
+ * @param {string} npmName 
+ * @param {Config} config 
+ * @returns 
+ */
+const isInPublishScope=(npmName,config)=>{
+    const ns=config.namespace?config.namespace+'/':'//';
+    return (
+        config.excludeNamespaceFromBuildList?
+            config.publishList?.includes(npmName):
+            (config.publishList?.includes(npmName) || npmName?.startsWith(ns))
+    )?true:false;
+}
+
+/**
  * @param {string[]|undefined} publishNames 
  */
 const publishPackagesAsync=async (publishNames)=>{
@@ -1132,7 +1157,6 @@ const publishPackagesAsync=async (publishNames)=>{
     /** @type {Config} */
     const config=await loadJsonOrDefaultAsync('pkij-config.json',{});
 
-    const ns=config.namespace?config.namespace+'/':'//';
     
     prePublish: for(let i=0;i<publishList.length;i++){
         const pkg=publishList[i];
@@ -1140,10 +1164,11 @@ const publishPackagesAsync=async (publishNames)=>{
             continue;
         }
         const version=pkg.packageJson.version;
-        if(pkg.disablePublish || !pkg.npmName || !version || (pkg.type) || !(config.excludeNamespaceFromBuildList?
-            config.publishList?.includes(pkg.npmName):
-            (config.publishList?.includes(pkg.npmName) || pkg.npmName?.startsWith(ns))
-        )){
+        if( pkg.disablePublish ||
+            !pkg.npmName ||
+            !version ||
+            !isInPublishScope(pkg.npmName,config)
+        ){
             publishList.splice(i,1);
             i--;
             continue;
@@ -1207,6 +1232,56 @@ const publishPackagesAsync=async (publishNames)=>{
             })
         }
     }
+}
+
+/**
+ * @param {string} version 
+ */
+const setVersionAsync=async (version)=>{
+    /** @type {Config} */
+    const config=await loadJsonOrDefaultAsync('pkij-config.json',{});
+    const dirs=await fs.readdir('./packages');
+    for(const dir of dirs){
+        const packageJsonPath=Path.join('./packages',dir,'package.json');
+        await setPackageVersionAsync(version,packageJsonPath,config,false);
+    }
+    await setPackageVersionAsync(version,'package.json',config,true);
+}
+
+/**
+ * @param {string} version
+ * @param {string} packageJsonPath
+ * @param {Config} config
+ * @param {boolean} ignoreScope
+ */
+const setPackageVersionAsync=async (version,packageJsonPath,config,ignoreScope)=>{
+    const pkg=await loadJsonOrDefaultAsync(packageJsonPath,false);
+    if(pkg===false || !pkg.name || !(ignoreScope?true:isInPublishScope(pkg.name,config))){
+        return;
+    }
+
+    if(!pkg.version){
+        pkg.version='0.0.0';
+    }
+    const ov=pkg.version;
+
+    if(version.startsWith('+')){
+        pkg.version=addVersions(pkg.version,version.substring(1));
+    }else{
+        pkg.version=version;
+    }
+
+    console.log(`${pkg.name} ${ov} -> ${pkg.version}`);
+    if(!dryRun){
+        await fs.writeFile(packageJsonPath,JSON.stringify(pkg,null,4));
+    }
+
+}
+
+const addVersions=(a,b)=>{
+    const aAry=a.split('.').map(n=>Number(n));
+    const bAry=b.split('.').map(n=>Number(n));
+    return `${(aAry[0]??0)+(bAry[0]??0)}.${(aAry[1]??0)+(bAry[1]??0)}.${(aAry[2]??0)+(bAry[2]??0)}`
 }
 
 const tsConfigReg=/^tsconfig\./i;
@@ -1707,6 +1782,8 @@ const showUsage=()=>{
 
 --publish       [path ...]      Publishes the specified packages or all packages in the package directory
                                 that are in the npm namespace or publish list if no packages are specified
+
+--set-version  [version]        Sets the version of all package.json files. If no version is supplied the all versions are increased by 0.0.1.
 
 --dry-run
 --dryRun                        If present a dry run is preformed and no changes to the filesystem is made
