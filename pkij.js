@@ -69,6 +69,7 @@ let deleteUnlinked=false;
 let migrateNxTsConfig=false;
 let publishPackages=false;
 let setVersion=undefined;
+let createLib=undefined;
 
 
 const main=async ()=>{
@@ -138,6 +139,11 @@ const main=async ()=>{
                 }else{
                     await addToAsync(eject,'pkij-config.json');
                 }
+                break;
+
+            case '--create-lib':
+                createLib=next;
+                hasAction=true;
                 break;
 
             case '--publish':
@@ -303,6 +309,10 @@ const main=async ()=>{
 
     if(publishPackages){
         await publishPackagesAsync(publishList);
+    }
+
+    if(createLib){
+        await createLibAsync(createLib);
     }
 
     if(packageJsonFileChanged && !skipNpmInstall){
@@ -1762,6 +1772,97 @@ const buildEsPackageAsync=async (pkg)=>{
 
 }
 
+const nameReg=/[\w-]/;
+
+/**
+ * @param {string} name 
+ */
+const createLibAsync=async (name)=>{
+    if(!nameReg.test(name)){
+        throw new Error('Invalid library name');
+    }
+
+    const dir=Path.join('packages',name);
+    if(await existsAsync(dir)){
+        throw new Error(`Lib directory already exists - ${dir}`);
+    }
+    /** @type {Config} */
+    const config=await loadJsonOrDefaultAsync('pkij-config.json',{});
+
+    const npmName=`${config.namespace}/${name}`
+
+    /** @type {Record<string,string>} */
+    const files={
+        'tsconfig.json':`
+{
+    "extends": "../../tsconfig.base.json",
+    "include": [
+        "src/**/*.ts",
+        "src/**/*.tsx"
+    ],
+    "exclude": [
+        "jest.config.ts",
+        "src/**/*.spec.ts",
+        "src/**/*.test.ts",
+        "src/**/*.spec.tsx",
+        "src/**/*.test.tsx"
+    ],
+    "compilerOptions": {}
+}
+        `,
+        'packages.json':`
+{
+    "name": "${npmName}",
+    "version": "0.0.0",
+    "type": "module",
+    "sideEffects": false
+}
+        `,
+        'src/index.ts':`export * from './lib/example.js';`,
+        'src/lib/example.ts':`export const exampleExport=true;`,
+        
+    };
+
+    if(!dryRun){
+        await fs.mkdir(dir,{recursive:true});
+    }
+
+    for(const e in files){
+        const path=Path.join(dir,e);
+        const value=files[e].trim()+'\n';
+        if(dryRun){
+            console.log(path,'->',value);
+        }else{
+            console.log(`write ${path}`);
+            await fs.mkdir(Path.dirname(path),{recursive:true});
+            await fs.writeFile(path,value);
+        }
+    }
+
+    const tsConfigBase=await loadJsonOrDefaultAsync('tsconfig.base.json',{});
+    if(!tsConfigBase.compilerOptions){
+        tsConfigBase.compilerOptions={};
+    }
+    if(!tsConfigBase.compilerOptions.paths){
+        tsConfigBase.compilerOptions.paths={};
+    }
+    tsConfigBase.compilerOptions.paths[npmName]=[Path.join(dir,'src/index.ts')];
+    const copy={}
+    const keys=Object.keys(tsConfigBase.compilerOptions.paths);
+    keys.sort();
+    for(const e of keys){
+        copy[e]=tsConfigBase.compilerOptions.paths[e];
+    }
+    tsConfigBase.compilerOptions.paths=copy;
+    if(dryRun){
+        console.log(`tsconfig.base.json -> ${JSON.stringify(tsConfigBase,null,4)}`);
+    }else{
+        console.log(`write tsconfig.base.json`);
+        await fs.writeFile('tsconfig.base.json',JSON.stringify(tsConfigBase,null,4));
+    }
+
+}
+
 const showUsage=()=>{
     console.log(`Usage:
     
@@ -1784,6 +1885,8 @@ const showUsage=()=>{
                                 that are in the npm namespace or publish list if no packages are specified
 
 --set-version  [version]        Sets the version of all package.json files. If no version is supplied the all versions are increased by 0.0.1.
+
+--create-lib   name             Creates a new library package
 
 --dry-run
 --dryRun                        If present a dry run is preformed and no changes to the filesystem is made
