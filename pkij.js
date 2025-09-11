@@ -25,15 +25,18 @@ const Path = require("node:path");
  * @prop {string[]|undefined} assets - markdown files and images
  * @prop {Config|undefined} config additional configuration
  * @prop {string|undefined} binDir A directory where bin commands should be compiled from
- * @prop {number|undefined} destModTime Time stamp of the last file write in the dest directory
+ * @prop {boolean|undefined} disablePublish Disables NPM publishing
  *
  * @typedef Config
- * @prop {'lib'|'nextjs'|'cdk'|'test'|undefined} type
+ * @prop {'lib'|'nextjs'|'cdk'|'test'|'repo'|undefined} type
  * @prop {Pkg[]|undefined} packages
  * @prop {string[]|undefined} ignore
  * @prop {BuildConfig|undefined} build
  * @prop {boolean|undefined} disabled
  * @prop {Record<string,any>} binBuildOptions ESBuild options used for building bin executables
+ * @prop {string|undefined} namespace NPM namespace
+ * @prop {string[]|undefined} publishList List of packages to publish in addition to packages with the same namespace as the namespace prop
+ * @prop {boolean|undefined} excludeNamespaceFromBuildList If true packages with the same namespace as the namespace prop will not be automatically included in the publishList
  *
  * @typedef BuildConfig
  * @prop {boolean|undefined} disabled
@@ -64,6 +67,7 @@ let skipNpmInstall=false;
 let deleteUnlinked=false;
 
 let migrateNxTsConfig=false;
+let publishPackages=false;
 
 
 const main=async ()=>{
@@ -95,6 +99,7 @@ const main=async ()=>{
     }
 
     let hasAction=false;
+    let publishList=undefined;
 
     for(let i=0;i<process.argv.length;i++){
 
@@ -131,6 +136,14 @@ const main=async ()=>{
                     }
                 }else{
                     await addToAsync(eject,'pkij-config.json');
+                }
+                break;
+
+            case '--publish':
+                publishPackages=true;
+                hasAction=true;
+                if(nextAll.length){
+                    publishList=nextAll;
                 }
                 break;
 
@@ -276,6 +289,10 @@ const main=async ()=>{
 
     if(migrateNxTsConfig){
         await migrateNxTsConfigAsync();
+    }
+
+    if(publishPackages){
+        await publishPackagesAsync(publishList);
     }
 
     if(packageJsonFileChanged && !skipNpmInstall){
@@ -1104,6 +1121,94 @@ const ejectAsync=async (pkg)=>{
 
 }
 
+/**
+ * @param {string[]|undefined} publishNames 
+ */
+const publishPackagesAsync=async (publishNames)=>{
+    await loadBuildPackagesAsync();
+
+    const publishList=publishNames?buildPkgs.filter(p=>publishNames.includes(p.dir)):buildPkgs;
+
+    /** @type {Config} */
+    const config=await loadJsonOrDefaultAsync('pkij-config.json',{});
+
+    const ns=config.namespace?config.namespace+'/':'//';
+    
+    prePublish: for(let i=0;i<publishList.length;i++){
+        const pkg=publishList[i];
+        if(!pkg){
+            continue;
+        }
+        const version=pkg.packageJson.version;
+        if(pkg.disablePublish || !pkg.npmName || !version || (pkg.type) || !(config.excludeNamespaceFromBuildList?
+            config.publishList?.includes(pkg.npmName):
+            (config.publishList?.includes(pkg.npmName) || pkg.npmName?.startsWith(ns))
+        )){
+            publishList.splice(i,1);
+            i--;
+            continue;
+        }
+
+        /** @type {Config} */
+        const pkConfig=await loadJsonOrDefaultAsync(Path.join(pkg.dir,'pkij-config.json'),{});
+        if((pkConfig.type??'lib')!=='lib'){
+            publishList.splice(i,1);
+            i--;
+            continue;
+        }
+
+        console.log(`https://registry.npmjs.org/${pkg.npmName}`)
+        const r=await fetch(`https://registry.npmjs.org/${pkg.npmName}`);
+        const isNew=r.status===404;
+
+        if(isNew){
+            console.log(`new package ${pkg.npmName}@${version}`);
+            continue;
+        }
+
+        if(!r.ok){
+            throw new Error(`unable to get npm package for ${pkg.npmName}`)
+        }
+
+        const info=await r.json();
+
+
+        if(info.versions[version]){
+            console.log(`${pkg.npmName}@${version} already published`);
+            publishList.splice(i,1);
+            i--;
+            continue;
+        }
+
+        const distTags=info['dist-tags']
+        if(distTags){
+            for(const e in distTags){
+                if(distTags[e]===version){
+                    console.log(`${pkg.name}@${version} already published`);
+                    publishList.splice(i,1);
+                    i--;
+                    continue prePublish;
+                }
+            }
+        }
+    }
+
+    for(const pkg of publishList){
+        console.log(`Publish ${pkg.npmName}@${pkg.packageJson.version}`);
+        const cmd=`npm publish --access public --tag latest`;
+        if(dryRun){
+            console.log(`dry run: ${pkg.dir}> ${cmd}`);
+        }else{
+            await spawnAsync({
+                cwd:pkg.dir,
+                cmd,
+                stderr:console.error,
+                stdout:console.log
+            })
+        }
+    }
+}
+
 const tsConfigReg=/^tsconfig\./i;
 
 const migrateNxTsConfigAsync=async ()=>{
@@ -1599,6 +1704,9 @@ const showUsage=()=>{
 --update-imports dir            Adds file extensions to all local inputs in the target directory
 
 --migrate-nx-tsconfig           Migrates tsconfig files used in NX projects
+
+--publish       [path ...]      Publishes the specified packages or all packages in the package directory
+                                that are in the npm namespace or publish list if no packages are specified
 
 --dry-run
 --dryRun                        If present a dry run is preformed and no changes to the filesystem is made
