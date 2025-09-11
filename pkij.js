@@ -18,9 +18,14 @@ const Path = require("node:path");
  * @prop {string|undefined} installedNpmVersion The installed npm version of the package
  * @prop {string|undefined} indexPath relative path to a index.ts or index.js file. Default = "src/index.ts"
  * @prop {Record<string,any>} packageJson Package json
+ * @prop {Record<string,any>} tsConfig tsconfig json
+ * @prop {string|undefined} tsConfigPath Path to tsconfig file relative to root of project
  * @prop {string[]} deps Direct package dependencies
+ * @prop {string[]} externalDeps external deps
  * @prop {string[]|undefined} assets - markdown files and images
  * @prop {Config|undefined} config additional configuration
+ * @prop {string|undefined} binDir A directory where bin commands should be compiled from
+ * @prop {number|undefined} destModTime Time stamp of the last file write in the dest directory
  *
  * @typedef Config
  * @prop {'lib'|'nextjs'|'cdk'|'test'|undefined} type
@@ -28,6 +33,7 @@ const Path = require("node:path");
  * @prop {string[]|undefined} ignore
  * @prop {BuildConfig|undefined} build
  * @prop {boolean|undefined} disabled
+ * @prop {Record<string,any>} binBuildOptions ESBuild options used for building bin executables
  *
  * @typedef BuildConfig
  * @prop {boolean|undefined} disabled
@@ -129,6 +135,9 @@ const main=async ()=>{
             case '--build':
                 hasAction=true;
                 const dirs=nextAll.length?nextAll.map(d=>(!d.includes('/') && !d.includes('\\'))?'packages/'+d:d):await getBuildPackagePathsAsync();
+                if(nextAll.length){
+                    buildIndividualPackages=true;
+                }
                 for(const d of dirs){
                     if(!buildPaths.includes(d)){
                         buildPaths.push(d);
@@ -140,6 +149,15 @@ const main=async ()=>{
                 buildPeerInternalOnly=true;
                 break;
 
+            case '--build-individual-packages':
+                buildIndividualPackages=true;
+                break;
+
+            case '--update-tsconfig':
+                updateTsConfigs=true;
+                hasAction=true;
+                break;
+
             case '--update-imports':
                 if(next){
                     updateImports=next;
@@ -149,6 +167,7 @@ const main=async ()=>{
 
             case '--dry-run':
             case '--dryRun':
+                console.log('dry-run');
                 dryRun=true;
                 break;
 
@@ -233,6 +252,11 @@ const main=async ()=>{
 
     for(const absPath in eject){
         await ejectAsync(eject[absPath]);
+    }
+
+    if(updateTsConfigs){
+        await loadBuildPackagesAsync();
+        await updateTsConfigsAsync();
     }
 
     if(buildPaths.length){
@@ -485,18 +509,34 @@ const isDirAsync=async (path)=>{
  */
 const populatePkgAsync=async (pkg)=>{
     const packageJsonPath=Path.join(pkg.dir,'package.json');
-    if(await existsAsync(packageJsonPath)){
-        const packageJson=await loadJsonAsync(packageJsonPath);
-        if((typeof packageJson.name === 'string') && !pkg.npmName){
-            pkg.npmName=packageJson.name;
-        }
-        pkg.packageJson=packageJson;
-    }
+    const tsConfigPath=Path.join(pkg.dir,'tsconfig.json');
     const configPath=Path.join(pkg.dir,'pkij-config.json');
-    if(await existsAsync(configPath)){
-        const configJson=await loadJsonAsync(configPath);
-        pkg.config=configJson;
-    }
+    await Promise.all([
+        (async ()=>{
+            if(await existsAsync(packageJsonPath)){
+                const packageJson=await loadJsonAsync(packageJsonPath);
+                if((typeof packageJson.name === 'string') && !pkg.npmName){
+                    pkg.npmName=packageJson.name;
+                }
+                pkg.packageJson=packageJson;
+            }
+        })(),
+        (async ()=>{
+            if(await existsAsync(configPath)){
+                const configJson=await loadJsonAsync(configPath);
+                pkg.config=configJson;
+            }
+        })(),
+        (async ()=>{
+            if(await existsAsync(tsConfigPath)){
+                const tsConfig=await loadJsonAsync(tsConfigPath);
+                pkg.tsConfig=tsConfig;
+                pkg.tsConfigPath=tsConfigPath;
+            }
+        })(),
+    ])
+    
+    
     if(!pkg.dest){
         pkg.dest=`packages/${Path.basename(pkg.dir)}`;
     }
@@ -513,9 +553,11 @@ const populatePkgAsync=async (pkg)=>{
 /**
  * Populates the dependencies of a Pkg
  * @param {Pkg} pkg
+ * @param {Record<string,any>} rootBuildPackageJson
+ * @param {Record<string,any>} rootTsConfig
  */
-const populatePkgDepsAsync=async (pkg)=>{
-    const {deps,assets}=await scanPackageAsync(pkg);
+const populatePkgPass2Async=async (pkg,rootBuildPackageJson,rootTsConfig)=>{
+    const {deps,externalDeps,assets,binDir}=await scanPackageAsync(pkg,rootBuildPackageJson,rootTsConfig);
 
     const packageJson={...pkg.packageJson}
     for(const name of deps){
@@ -537,8 +579,79 @@ const populatePkgDepsAsync=async (pkg)=>{
     }
     pkg.packageJson=packageJson;
     pkg.deps=deps;
+    pkg.externalDeps=externalDeps;
     pkg.assets=assets;
+    pkg.binDir=binDir;
 }
+
+
+const getModeTimeAsync=async (path,exists,min,timeRef)=>{
+    if(exists===undefined){
+        exists=await existsAsync(path);
+    }
+    if(!exists){
+        return;
+    }
+    const info=await fs.stat(path);
+    const time=Math.max(info.ctimeMs,info.mtimeMs);
+    if(timeRef.time===undefined || (min?time<timeRef.time:time>timeRef.time)){
+        timeRef.time=time;
+    }
+}
+
+/**
+ * Builds a package
+ * @param {Pkg} pkg
+ * @param {Record<string,any>} rootBuildPackageJson
+ * @param {Record<string,any>} rootTsConfig
+ * @returns {Promise<{deps:string[],externalDeps:string[],assets:string[],binDir:string|undefined>}
+ */
+const scanPackageAsync=async (pkg,rootBuildPackageJson,rootTsConfig)=>{
+
+    const deps=[];
+    const externalDeps=[];
+    const assets=[];
+
+    const binDir=Path.join(pkg.dir,'src/bin');
+    const binPromise=existsAsync(binDir);
+
+    const {outDir}=getPkgOut(pkg);
+
+    const promises=[];
+    
+    await scanDirAsync(pkg.dir,outDir,async (name,srcPath,destPath,isDir)=>{
+        if(isDir){
+            return;
+        }
+
+        if(tsReg.test(name) && !name.includes('.spec.')){
+            const file=await loadTextAsync(srcPath);
+            findDeps(file,importReg,2,deps,externalDeps,rootBuildPackageJson,rootTsConfig);
+            findDeps(file,requireReg,2,deps,externalDeps,rootBuildPackageJson,rootTsConfig);
+        }
+
+        const e=name.lastIndexOf('.');
+        const ext=e===-1?'':name.substring(e+1);
+
+        if(assetsExtensions.includes(ext)){
+            assets.push(srcPath);
+        }
+
+    });
+
+    await Promise.all(promises);
+
+    deps.sort();
+    assets.sort();
+
+    return {
+        deps,
+        externalDeps,
+        assets,
+        binDir:(await binPromise)?binDir:undefined
+    };
+}
+
 
 /**
  * Reads a file as a string
@@ -1033,10 +1146,53 @@ const buildPaths=[];
 const buildPkgs=[];
 let rootBuildPackageJson={};
 let rootTsConfig={};
-let buildDir='./'
-const buildAsync=async ()=>{
+let buildDir='./';
+let updateTsConfigs=false;
+let buildIndividualPackages=false;
 
-    const startTime=Date.now();
+const updateTsConfigsAsync=async ()=>{
+
+    await Promise.all(buildPkgs.map(async pkg=>{
+        if(!pkg.tsConfig || !pkg.tsConfigPath){
+            return;
+        }
+        if(!pkg.tsConfig.compilerOptions){
+            pkg.tsConfig.compilerOptions={};
+        }
+        const refs=[];
+        if(pkg.deps){
+            for(const dep of pkg.deps){
+                const depPkg=buildPkgs.find(p=>p.npmName===dep);
+                if(depPkg){
+                    refs.push({path:joinPaths('../..',depPkg.dir)})
+                }
+            }
+        }
+        refs.sort((a,b)=>a.path.localeCompare(b.path));
+        pkg.tsConfig.references=refs;
+        delete pkg.tsConfig.compilerOptions.composite;
+        if(dryRun){
+            console.log(`${pkg.tsConfigPath} = ${JSON.stringify(pkg.tsConfig,null,4)}`)
+        }else{
+            await fs.writeFile(pkg.tsConfigPath,JSON.stringify(pkg.tsConfig,null,4));
+        }
+    }));
+
+    const rootTsPath='./tsconfig.json';
+    const rootTsConfig=await loadJsonOrDefaultAsync(rootTsPath,{});
+    if(!rootTsConfig.files){
+        rootTsConfig.files=[];
+    }
+    rootTsConfig.references=buildPkgs.map(p=>({path:'./'+p.dir}));
+    rootTsConfig.references.sort((a,b)=>a.path.localeCompare(b.path));
+    if(dryRun){
+        console.log(`${rootTsPath} = ${JSON.stringify(rootTsConfig,null,4)}`);
+    }else{
+        await fs.writeFile(rootTsPath,JSON.stringify(rootTsConfig,null,4));
+    }
+}
+
+const loadBuildPackagesAsync=async ()=>{
 
     rootBuildPackageJson=await loadJsonAsync('./package.json');
     rootTsConfig=await loadJsonOrDefaultAsync('./tsconfig.base.json');
@@ -1052,10 +1208,32 @@ const buildAsync=async ()=>{
         buildPkgs.push(pkg);
     }));
 
-    await Promise.all(buildPkgs.map(pkg=>populatePkgDepsAsync(pkg)));
+    await Promise.all(buildPkgs.map(pkg=>populatePkgPass2Async(pkg,rootBuildPackageJson,rootTsConfig)));
+}
+
+const buildAsync=async ()=>{
+
+    const startTime=Date.now();
+
+    await loadBuildPackagesAsync();
+
+    await updateTsConfigsAsync();
 
     const max=1000;
     const working=[];
+
+    if(!buildIndividualPackages){
+        const buildCmd=`npx tsc --build`;
+        if(dryRun){
+            console.log(`dry run> ${buildCmd}`);
+        }else{
+            await spawnAsync({
+                cmd:buildCmd,
+                stderr:console.error,
+                stdout:console.log
+            });
+        }
+    }
 
     const buildList=buildPkgs.filter(p=>buildPaths.includes(p.dir));
     for(const pkg of buildList){
@@ -1079,7 +1257,7 @@ const getBuildPackagePathsAsync=async ()=>{
     const buildPaths=[];
     const dirs=await fs.readdir('./packages',{withFileTypes:true});
     for(const d of dirs){
-        if(d.isDirectory() && !ignoreList.includes(d.name)){
+        if(d.isDirectory() && !ignoreList.includes(d.name) && await existsAsync(Path.join('./packages',d.name,'tsconfig.json'))){
             buildPaths.push(Path.join('packages',d.name));
         }
     }
@@ -1088,7 +1266,7 @@ const getBuildPackagePathsAsync=async ()=>{
 
 const importReg=/(import|export[ \t]+\*)\s+.*?\s*from\s+['"]([^'"]+)['"]/gs;
 const requireReg=/\W(require|import)\s*\(\s*['"]([^'"]+)['"]\s*\)/gs;
-const tsReg=/\.tsx?/i
+const tsReg=/\.tsx?$/i
 
 /**
  * @param {string} name
@@ -1107,59 +1285,59 @@ const assetsExtensions=[
     'gif',
 ]
 
+const invalidImportReg=/[\$\+'"`]/
+
 /**
  * @param {string} content
  * @param {RegExp} reg
  * @param {number} matchI
  * @param {string[]} deps
+ * @param {string[]} externalDeps
+ * @param {Record<string,any>} rootBuildPackageJson
+ * @param {Record<string,any>} rootTsConfig
  */
-const findDeps=(content,reg,matchI,deps)=>{
+const findDeps=(content,reg,matchI,deps,externalDeps,rootBuildPackageJson,rootTsConfig)=>{
     content='\n'+content;
     let match;
     while(match=reg.exec(content)){
         const name=formatImportName(match[matchI])
         if(!name.startsWith('.') && !name.startsWith('@/') && !deps.includes(name)){
-            deps.push(name);
+            if(!invalidImportReg.test(name)){
+                if(isProjectDep(name,rootBuildPackageJson,rootTsConfig)){
+                    deps.push(name);
+                }else{
+                    externalDeps.push(name);
+                }
+            }
         }
     }
 }
 
 /**
- * Builds a package
- * @param {string} tsConfig
- * @param {Pkg} pkg
- * @returns {Promise<{deps:string[],assets:string[]}>}
+ * @param {string} name
+ * @param {Record<string,any>} rootBuildPackageJson
+ * @param {Record<string,any>} rootTsConfig
  */
-const scanPackageAsync=async (pkg)=>{
+const isProjectDep=(name,rootBuildPackageJson,rootTsConfig)=>{
+    const isProjectDep=(
+        (rootBuildPackageJson?.dependencies && (name in rootBuildPackageJson.dependencies)) ||
+        (rootBuildPackageJson?.devDependencies && (name in rootBuildPackageJson.devDependencies)) ||
+        (rootBuildPackageJson?.peerDependencies && (name in rootBuildPackageJson.peerDependencies)) ||
+        (rootTsConfig?.compilerOptions?.paths && (name in rootTsConfig.compilerOptions.paths))
+    )?true:false;
+    return isProjectDep;
+}
 
-    const deps=[];
-    const assets=[];
-
-    await scanDirAsync(pkg.dest,pkg.dir,async (name,destPath,srcPath,isDir)=>{
-        if(isDir){
-            return;
-        }
-
-
-        if(tsReg.test(name) && !name.includes('.spec.')){
-            const file=await loadTextAsync(srcPath);
-            findDeps(file,importReg,2,deps);
-            findDeps(file,requireReg,2,deps);
-        }
-
-        const e=name.lastIndexOf('.');
-        const ext=e===-1?'':name.substring(e+1);
-
-        if(assetsExtensions.includes(ext)){
-            assets.push(srcPath);
-        }
-
-    });
-
-    deps.sort();
-    assets.sort();
-
-    return {deps,assets};
+const getPkgOut=(pkg)=>{
+    const outBaseDir=Path.join(
+        pkg.dir,
+        pkg.tsConfig?.compilerOptions?.outDir??'../../dist'
+    );
+    const outDir=Path.join(
+        outBaseDir,
+        pkg.dir,
+    );
+    return {outBaseDir,outDir}
 }
 
 /**
@@ -1168,68 +1346,176 @@ const scanPackageAsync=async (pkg)=>{
  */
 const buildPackageAsync=async (pkg)=>{
 
-    if(pkg.config?.build?.disabled || pkg.config?.disabled || (pkg.config?.type??'lib')!=='lib'){
+    if(pkg.config?.build?.disabled || pkg.config?.disabled){
         return;
     }
 
-    const tsConfigPath=Path.join(pkg.dir,'tsconfig.json');
+    const {outBaseDir,outDir}=getPkgOut(pkg);
 
-    const tsConfigExists=await existsAsync(tsConfigPath);
-    if(!tsConfigExists){
-        return;
+    if(buildIndividualPackages && (pkg.config?.type??'lib')==='lib'){
+        await buildLibAsync(pkg,outBaseDir,outDir);
     }
 
-    const tsConfig=await loadJsonAsync(tsConfigPath);
-
-    await buildEsPackageAsync({tsConfigPath,pkg,tsConfig});
-
-    const outBaseDir=Path.join(
-        pkg.dir,
-        tsConfig?.compilerOptions?.outDir??'../../dist'
-    );
-    const outDir=Path.join(
-        outBaseDir,
-        pkg.dir,
-    );
+    if(pkg.binDir){
+        await buildBinAsync(pkg,outBaseDir,outDir);
+    }
 
     const packageJson={...pkg.packageJson}
-    if(!packageJson.main && await existsAsync(Path.join(outDir,'src/index.js'))){
-        packageJson.main='./src/index.js'
+    const [outExists,srcExists,indexExists]=await Promise.all([
+        existsAsync(outDir),
+        existsAsync(Path.join(outDir,'src')),
+        existsAsync(Path.join(outDir,'src/index.js')),
+    ])
+    if(!packageJson.main && indexExists){
+        packageJson.main='./src/index.js';
     }
 
-    await Promise.all([
-        fs.writeFile(Path.join(outDir,'package.json'),JSON.stringify(packageJson,null,4)),
-        fs.writeFile(Path.join(outDir,'src/package.json'),'{"sideEffects":false}'),
-        ...(pkg.assets?.map(a=>fs.copyFile(a,Path.join(outBaseDir,a)))??[])
-    ]);
+    if(!dryRun && outExists){
+        await Promise.all([
+            fs.writeFile(Path.join(outDir,'package.json'),JSON.stringify(packageJson,null,4)),
+            srcExists?fs.writeFile(Path.join(outDir,'src/package.json'),'{"sideEffects":false}'):null,
+            ...(pkg.assets?.map(a=>copyAsync(a,Path.join(outBaseDir,a)))??[])
+        ]);
+    }
+
+}
+
+const copyAsync=async (src,dest)=>{
+    const dir=Path.dirname(dest);
+    if(!await existsAsync(dir)){
+        await fs.mkdir(dir,{recursive:true})
+    }
+    await fs.copyFile(src,dest);
 }
 
 /**
- * @typedef EsBuildOptions
- * @prop {string} tsConfigPath Location of tsconfig file
- * @prop {string|undefined} outSuffix directory added to out path
- * @prop {Pkg} pkg package to build
- * @prop {Record<string,any>} tsConfig tsconfig contents
+ * Builds a package as a library
+ * @param {Pkg} pkg
+ * @param {string} outBaseDir
+ * @param {string} outDir
  */
+const buildLibAsync=async (pkg,outBaseDir,outDir)=>{
+
+    const tsConfig=pkg.tsConfig;
+    if(!tsConfig || !pkg.tsConfigPath){
+        return;
+    }
+
+    await buildEsPackageAsync(pkg);
+}
+
+const nodeExternals=['path','fs','events','readline','http','os','stream','child_Process','inspector']
+
+/**
+ * Builds a package as an executable
+ * @param {Pkg} pkg
+ * @param {string} outBaseDir
+ * @param {string} outDir
+ */
+const buildBinAsync=async (pkg,outBaseDir,outDir)=>{
+    if(!pkg.tsConfigPath || !pkg.binDir){
+        return;
+    }
+
+    const files=(
+        (await fs.readdir(pkg.binDir))
+        .filter(f=>f.toLowerCase().endsWith('.ts') || f.toLowerCase().endsWith('.js'))
+        .map(f=>Path.join(pkg.binDir,f))
+    )
+    if(!files.length){
+        return;
+    }
+
+    const outdir=await fs.realpath(Path.join(outBaseDir,pkg.binDir))
+    const config={
+        outdir,
+        bundle:true,
+        platform:"node",
+        target:"node20",
+        minify:true,
+        "banner:js":"#!/usr/bin/env node",
+        sourcemap:"external",
+        external:['node:*',...nodeExternals,...(pkg.externalDeps??[])],
+        'tree-shaking':true,
+        ...pkg.binBuildOptions,
+    }
+    const configDir=Path.join('.pkij',pkg.dir);
+    const configPath=Path.join(configDir,'esbuild-config.json');
+
+    if(!dryRun){
+        await fs.rm(outdir,{recursive:true,force:true});
+        await fs.mkdir(outdir,{recursive:true});
+        await fs.mkdir(configDir,{recursive:true});
+        await fs.writeFile(configPath,JSON.stringify(config,null,4));
+    }
+
+    try{
+        const start=Date.now();
+        const cmd=`npx esbuild ${files.join(' ')} ${objToArts(config)}`;
+        if(dryRun){
+            console.log(`dry run> ${cmd}`);
+        }else{
+            await spawnAsync({
+                cwd:pkg.dir,
+                cmd,
+                stderr:console.error,
+                stdout:console.log
+            })
+        }
+
+        console.log(`${pkg.dir} complete - ${(Date.now()-start).toLocaleString()}ms`)
+    }catch(ex){
+        console.error(`Failed to build bin ${pkg.binDir}`,ex);
+        throw ex;
+    }
+}
+
+const objToArts=(obj)=>{
+    let args=[];
+    for(const e in obj){
+        const v=obj[e];
+        if(Array.isArray(v)){
+            for(const value of v){
+                args.push(`'--${e}:${escapeCliArg(value)}'`);
+            }
+        }else{
+            args.push(`'--${e}=${escapeCliArg(v)}'`);
+        }
+    }
+    return args.join(' ');
+}
+
+const escapeCliArg=(arg)=>{
+    return (arg?.toString()??'').replace(/'/g,"\\'");
+}
+
 
 /**
  * Builds a package
- * @param {EsBuildOptions} options
+ * @param {Pkg} pkg
  */
-const buildEsPackageAsync=async ({tsConfigPath,pkg,outSuffix,tsConfig})=>{
+const buildEsPackageAsync=async (pkg)=>{
+    if(!pkg.tsConfigPath){
+        return;
+    }
     console.log(`Build ${pkg.dir}`);
-    console.log(pkg);
+    if(verbose){
+        console.log(pkg);
+    }
     let start=Date.now();
     
     try{
-        await spawnAsync({
-            cwd:pkg.dir,
-            cmd:(
-                `npx tsc --project '${Path.basename(tsConfigPath)}'`
-            ),
-            stderr:console.error,
-            stdout:console.log
-        })
+        const cmd=`npx tsc --project '${Path.basename(pkg.tsConfigPath)}'`;
+        if(dryRun){
+            console.log(`dry run> ${cmd}`);
+        }else{
+            await spawnAsync({
+                cwd:pkg.dir,
+                cmd,
+                stderr:console.error,
+                stdout:console.log
+            })
+        }
 
         console.log(`${pkg.dir} complete - ${(Date.now()-start).toLocaleString()}ms`)
     }catch(ex){
@@ -1243,13 +1529,17 @@ const showUsage=()=>{
     console.log(`Usage:
     
 --inject        [path ...]      List of package source config files or paths to package directories to inject.
-                        If no paths are provided a default value of "pkij-config.json" is used.
+                                If no paths are provided a default value of "pkij-config.json" is used.
 
 
 --eject         [path ...]      List of package source config files or paths to package directories to eject.
                                 If no paths are provided a default value of "pkij-config.json" is used.
 
---build         [path ...]      Builds a package
+--build         [path ...]      Builds packages. If no packages are specified all packages are built.
+--build-peer-internal-only      If present only internal packages ( packages in the packages directory) will be peers
+--build-individual-packages     If present individual packages will be built with tsc instead of building all projects in a single pass
+
+--update-imports dir            Adds file extensions to all local inputs in the target directory
 
 --dry-run
 --dryRun                        If present a dry run is preformed and no changes to the filesystem is made
@@ -1281,6 +1571,91 @@ const showUsage=()=>{
                                 injecting packages
 
 --verbose                       If present verbose logging will be enabled.`)
+}
+
+
+
+const bsReg=/\\/g;
+const doubleSlashReg=/\/{2,}/g;
+const sdsReg=/\/\.\//g;
+const parentDirReg=/(^|\/)[^\/]+\/\.\.(\/|$)/g;
+/**
+ * @param {string} path 
+ * @returns {string}
+ */
+const normalizePath=(path)=>{
+    while(true){
+        const n=_normalizePath(path);
+        if(n===path){
+            return n;
+        }
+        path=n;
+    }
+}
+
+/**
+ * @param {string} path 
+ * @returns {string}
+ */
+const _normalizePath=(path)=>{
+    const proto=protocolReg.exec(path)?.[0]??'';
+    if(proto){
+        path=path.substring(proto.length);
+    }
+    if(path.includes('\\')){
+        path=path.replace(bsReg,'/');
+    }
+    if(path.includes('/./')){
+        path=path.replace(sdsReg,'/');
+    }
+    if(path.endsWith('/.')){
+        path=path.substring(0,path.length-1);
+    }
+    if(path.includes('//')){
+        path=path.replace(doubleSlashReg,'/');
+    }
+    if(path==='/'){
+        return proto+path;
+    }
+    if(path.endsWith('/')){
+        path=path.substring(0,path.length-1);
+    }
+    if(path.includes('..')){
+        path=path.replace(parentDirReg,'/');
+    }
+    if(!path){
+        path='.';
+    }
+    return proto+path;
+}
+
+/**
+ * @param {...string[]} paths
+ * @returns {string}
+ */
+const joinPaths=(...paths)=>
+{
+    if(!paths){
+        return '';
+    }
+    let path=paths[0];
+    if(path.endsWith('/')){
+        path=path.substring(0,path.length-1);
+    }
+    for(let i=1;i<paths.length;i++){
+        const part=paths[i];
+        if(!part){
+            continue;
+        }
+        path+=(part[0]==='/'?'':'/')+part;
+        if(path.endsWith('/')){
+            path=path.substring(0,path.length-1);
+            if(!path){
+                path='/';
+            }
+        }
+    }
+    return path;
 }
 
 (async ()=>{
