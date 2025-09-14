@@ -42,6 +42,8 @@ const Path = require("node:path");
  * @prop {boolean|undefined} disabled
  */
 
+const pkijConfigFileName='.pkij.json'
+
 const mergePkgProps=['isNpmDevDep','installedNpmVersion'];
 
 const currentPkgFile='.pkij-injected-packages.json';
@@ -126,7 +128,7 @@ const main=async ()=>{
                         await addToAsync(inject,n);
                     }
                 }else{
-                    await addToAsync(inject,'pkij-config.json');
+                    await addToAsync(inject,pkijConfigFileName);
                 }
                 break;
 
@@ -137,7 +139,7 @@ const main=async ()=>{
                         await addToAsync(eject,n);
                     }
                 }else{
-                    await addToAsync(eject,'pkij-config.json');
+                    await addToAsync(eject,pkijConfigFileName);
                 }
                 break;
 
@@ -558,7 +560,7 @@ const isDirAsync=async (path)=>{
 const populatePkgAsync=async (pkg)=>{
     const packageJsonPath=Path.join(pkg.dir,'package.json');
     const tsConfigPath=Path.join(pkg.dir,'tsconfig.json');
-    const configPath=Path.join(pkg.dir,'pkij-config.json');
+    const configPath=Path.join(pkg.dir,pkijConfigFileName);
     await Promise.all([
         (async ()=>{
             if(await existsAsync(packageJsonPath)){
@@ -1165,7 +1167,7 @@ const publishPackagesAsync=async (publishNames)=>{
     const publishList=publishNames?buildPkgs.filter(p=>publishNames.includes(p.dir)):buildPkgs;
 
     /** @type {Config} */
-    const config=await loadJsonOrDefaultAsync('pkij-config.json',{});
+    const config=await loadJsonOrDefaultAsync(pkijConfigFileName,{});
 
     
     prePublish: for(let i=0;i<publishList.length;i++){
@@ -1185,7 +1187,7 @@ const publishPackagesAsync=async (publishNames)=>{
         }
 
         /** @type {Config} */
-        const pkConfig=await loadJsonOrDefaultAsync(Path.join(pkg.dir,'pkij-config.json'),{});
+        const pkConfig=await loadJsonOrDefaultAsync(Path.join(pkg.dir,pkijConfigFileName),{});
         if((pkConfig.type??'lib')!=='lib'){
             publishList.splice(i,1);
             i--;
@@ -1249,7 +1251,7 @@ const publishPackagesAsync=async (publishNames)=>{
  */
 const setVersionAsync=async (version)=>{
     /** @type {Config} */
-    const config=await loadJsonOrDefaultAsync('pkij-config.json',{});
+    const config=await loadJsonOrDefaultAsync(pkijConfigFileName,{});
     const dirs=await fs.readdir('./packages');
     for(const dir of dirs){
         const packageJsonPath=Path.join('./packages',dir,'package.json');
@@ -1787,7 +1789,7 @@ const createLibAsync=async (name)=>{
         throw new Error(`Lib directory already exists - ${dir}`);
     }
     /** @type {Config} */
-    const config=await loadJsonOrDefaultAsync('pkij-config.json',{});
+    const config=await loadJsonOrDefaultAsync(pkijConfigFileName,{});
 
     const npmName=`${config.namespace}/${name}`
 
@@ -1867,11 +1869,11 @@ const showUsage=()=>{
     console.log(`Usage:
     
 --inject        [path ...]      List of package source config files or paths to package directories to inject.
-                                If no paths are provided a default value of "pkij-config.json" is used.
+                                If no paths are provided a default value of ".pkij.json" is used.
 
 
 --eject         [path ...]      List of package source config files or paths to package directories to eject.
-                                If no paths are provided a default value of "pkij-config.json" is used.
+                                If no paths are provided a default value of ".pkij.json" is used.
 
 --build         [path ...]      Builds packages. If no packages are specified all packages are built.
 --build-peer-internal-only      If present only internal packages ( packages in the packages directory) will be peers
