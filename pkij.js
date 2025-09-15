@@ -4,6 +4,7 @@
 const child_process = require("node:child_process");
 const fs = require("node:fs/promises");
 const Path = require("node:path");
+const readline = require('readline');
 
 /**
  * @typedef Pkg
@@ -29,12 +30,13 @@ const Path = require("node:path");
  *
  * @typedef Config
  * @prop {'lib'|'nextjs'|'cdk'|'test'|'repo'|undefined} type
- * @prop {Pkg[]|undefined} packages
+ * @prop {Pkg[]|undefined} inject Packages to inject
  * @prop {string[]|undefined} ignore
  * @prop {BuildConfig|undefined} build
  * @prop {boolean|undefined} disabled
  * @prop {Record<string,any>} binBuildOptions ESBuild options used for building bin executables
  * @prop {string|undefined} namespace NPM namespace
+ * @prop {string[]|undefined} additionalNamespaces Additional npm namespaces
  * @prop {string[]|undefined} publishList List of packages to publish in addition to packages with the same namespace as the namespace prop
  * @prop {boolean|undefined} excludeNamespaceFromBuildList If true packages with the same namespace as the namespace prop will not be automatically included in the publishList
  *
@@ -72,6 +74,10 @@ let migrateNxTsConfig=false;
 let publishPackages=false;
 let setVersion=undefined;
 let createLib=undefined;
+let listDeps=false;
+let yes=false;
+let publishNoBuild=false;
+let cleanProject=false;
 
 
 const main=async ()=>{
@@ -88,9 +94,9 @@ const main=async ()=>{
     */
     const eject={};
 
-    const addToAsync=async (dic,path)=>{
+    const addInjectedToAsync=async (dic,path)=>{
         /** @type {Pkg[]} */
-        const pkgs=await getPkgsAsync(path);
+        const pkgs=await getInjectedPkgsAsync(path);
         for(const p of pkgs){
             let abs=(await fs.realpath(p.dir)).toLowerCase();
             if(abs.endsWith('/')){
@@ -104,6 +110,19 @@ const main=async ()=>{
 
     let hasAction=false;
     let publishList=undefined;
+
+    const initBuildAsync=async (nextAll)=>{
+        hasAction=true;
+        const dirs=nextAll.length?nextAll.map(d=>(!d.includes('/') && !d.includes('\\'))?'packages/'+d:d):await getBuildPackagePathsAsync();
+        if(nextAll.length){
+            buildIndividualPackages=true;
+        }
+        for(const d of dirs){
+            if(!buildPaths.includes(d)){
+                buildPaths.push(d);
+            }
+        }
+    }
 
     for(let i=0;i<process.argv.length;i++){
 
@@ -125,10 +144,10 @@ const main=async ()=>{
                 hasAction=true;
                 if(nextAll.length){
                     for(const n of nextAll){
-                        await addToAsync(inject,n);
+                        await addInjectedToAsync(inject,n);
                     }
                 }else{
-                    await addToAsync(inject,pkijConfigFileName);
+                    await addInjectedToAsync(inject,pkijConfigFileName);
                 }
                 break;
 
@@ -136,11 +155,20 @@ const main=async ()=>{
                 hasAction=true;
                 if(nextAll.length){
                     for(const n of nextAll){
-                        await addToAsync(eject,n);
+                        await addInjectedToAsync(eject,n);
                     }
                 }else{
-                    await addToAsync(eject,pkijConfigFileName);
+                    await addInjectedToAsync(eject,pkijConfigFileName);
                 }
+                break;
+            
+            case '--yes':
+                yes=true;
+                break;
+            
+            case '--clean':
+                cleanProject=true;
+                hasAction=true;
                 break;
 
             case '--create-lib':
@@ -151,22 +179,20 @@ const main=async ()=>{
             case '--publish':
                 publishPackages=true;
                 hasAction=true;
+                await initBuildAsync(nextAll);
                 if(nextAll.length){
                     publishList=nextAll;
+                }else{
+                    publishList=[...buildPaths];
                 }
                 break;
 
+            case '--publish-no-build':
+                publishNoBuild=true;
+                break;
+
             case '--build':
-                hasAction=true;
-                const dirs=nextAll.length?nextAll.map(d=>(!d.includes('/') && !d.includes('\\'))?'packages/'+d:d):await getBuildPackagePathsAsync();
-                if(nextAll.length){
-                    buildIndividualPackages=true;
-                }
-                for(const d of dirs){
-                    if(!buildPaths.includes(d)){
-                        buildPaths.push(d);
-                    }
-                }
+                await initBuildAsync(nextAll);
                 break;
 
             case '--build-peer-internal-only':
@@ -189,6 +215,11 @@ const main=async ()=>{
                 }
                 break;
 
+            case '--list-deps':
+                listDeps=true;
+                hasAction=true;
+                break;
+
             case '--set-version':
                 setVersion=next||'+0.0.1';
                 hasAction=true;
@@ -203,6 +234,7 @@ const main=async ()=>{
             case '--dryRun':
                 console.log('dry-run');
                 dryRun=true;
+                yes=true;
                 break;
 
             case '--link':
@@ -280,12 +312,18 @@ const main=async ()=>{
         buildPaths,
     })
 
+    if(cleanProject){
+        await cleanProjectAsync();
+    }
+
     for(const absPath in inject){
         await injectAsync(inject[absPath]);
+        updateTsConfigs=true;
     }
 
     for(const absPath in eject){
         await ejectAsync(eject[absPath]);
+        updateTsConfigs=true;
     }
 
     if(updateTsConfigs){
@@ -293,7 +331,11 @@ const main=async ()=>{
         await updateTsConfigsAsync();
     }
 
-    if(buildPaths.length){
+    if(listDeps){
+        await listDepsAsync();
+    }
+
+    if(buildPaths.length && !(publishPackages && publishNoBuild)){
         await buildAsync();
     }
 
@@ -325,6 +367,34 @@ const main=async ()=>{
     }
 
     console.log('pkij done');
+}
+
+/**
+ * Reads a line of text from the terminal
+ * @param {string} message
+ * @returns {Promise<string>}
+ */
+const promptAsync=(message)=>{
+    const rl=readline.createInterface({
+        input:process.stdin,
+        output:process.stdout
+    });
+
+    return new Promise((resolve)=>{
+
+        rl.question(message+' ',(value)=>{
+            rl.close();
+            resolve(value);
+        });
+    })
+}
+/**
+ * @param {string} message 
+ * @returns {Promise<boolean>}
+ */
+const promptYesNoAsync=async (message)=>{
+    const r=await promptAsync(message+' [y/N]');
+    return r.trim().toLowerCase()==='y';
 }
 
 
@@ -390,8 +460,8 @@ const spawnAsync=(
         cwd,
         out,
         silent,
-        stdout,
-        stderr,
+        stdout=console.log,
+        stderr=console.error,
         onChild,
         onOutput,
         onError,
@@ -493,7 +563,7 @@ const spawnAsync=(
  * @param {string} path
  & @returns {Promise<Pkg[]>}
  */
-const getPkgsAsync=async (path)=>{
+const getInjectedPkgsAsync=async (path)=>{
 
     try{
 
@@ -508,7 +578,7 @@ const getPkgsAsync=async (path)=>{
             if(config.ignore){
                 ignoreList.push(...config.ignore);
             }
-            for(const pkg of config.packages){
+            for(const pkg of config.inject){
                 await populatePkgAsync(pkg);
                 pkgs.push(pkg);
             }
@@ -1154,7 +1224,7 @@ const isInPublishScope=(npmName,config)=>{
     return (
         config.excludeNamespaceFromBuildList?
             config.publishList?.includes(npmName):
-            (config.publishList?.includes(npmName) || npmName?.startsWith(ns))
+            (config.publishList?.includes(npmName) || npmName?.startsWith(ns) || config.additionalNamespaces?.includes(npmName))
     )?true:false;
 }
 
@@ -1169,7 +1239,7 @@ const publishPackagesAsync=async (publishNames)=>{
     /** @type {Config} */
     const config=await loadJsonOrDefaultAsync(pkijConfigFileName,{});
 
-    
+    const newPkgs=[];
     prePublish: for(let i=0;i<publishList.length;i++){
         const pkg=publishList[i];
         if(!pkg){
@@ -1200,6 +1270,7 @@ const publishPackagesAsync=async (publishNames)=>{
 
         if(isNew){
             console.log(`new package ${pkg.npmName}@${version}`);
+            newPkgs.push(pkg);
             continue;
         }
 
@@ -1229,19 +1300,45 @@ const publishPackagesAsync=async (publishNames)=>{
             }
         }
     }
+//
+    await spawnAsync({cmd:`npm config list`})
+
+    console.log('\nPackages to be published:\n-------------------------------------');
+    for(const pkg of publishList){
+        console.log(`${getPkgOut(pkg).outDir} -> ${pkg.npmName}@${pkg.packageJson.version}${newPkgs.includes(pkg)?' (new)':''}`);
+    }
+    console.log('-------------------------------------\n');
+
+    if(!yes){
+        const r=await promptYesNoAsync('Packages ready to publish. Would you like to continue?');
+        if(!r){
+            return;
+        }
+    }
+
+    const rcName='.npmrc';
+    const npmrcExists=await existsAsync(rcName);
 
     for(const pkg of publishList){
-        console.log(`Publish ${pkg.npmName}@${pkg.packageJson.version}`);
+        const outDir=await fs.realpath(getPkgOut(pkg).outDir);
+        console.log(`Publish ${outDir} -> ${pkg.npmName}@${pkg.packageJson.version}${newPkgs.includes(pkg)?' (new)':''}`);
         const cmd=`npm publish --access public --tag latest`;
         if(dryRun){
             console.log(`dry run: ${pkg.dir}> ${cmd}`);
         }else{
-            await spawnAsync({
-                cwd:pkg.dir,
-                cmd,
-                stderr:console.error,
-                stdout:console.log
-            })
+            if(npmrcExists){
+                await fs.copyFile(rcName,Path.join(outDir,rcName));
+            }
+            try{
+                await spawnAsync({
+                    cwd:outDir,
+                    cmd,
+                })
+            }finally{
+                if(npmrcExists){
+                    await fs.rm(Path.join(outDir,rcName));
+                }
+            }
         }
     }
 }
@@ -1419,7 +1516,7 @@ const updateTsConfigsAsync=async ()=>{
         }
         refs.sort((a,b)=>a.path.localeCompare(b.path));
         pkg.tsConfig.references=refs;
-        delete pkg.tsConfig.compilerOptions.composite;
+        pkg.tsConfig.compilerOptions.composite=true;
         if(dryRun){
             console.log(`${pkg.tsConfigPath} = ${JSON.stringify(pkg.tsConfig,null,4)}`)
         }else{
@@ -1441,7 +1538,13 @@ const updateTsConfigsAsync=async ()=>{
     }
 }
 
+let buildPackagesLoaded=false;
 const loadBuildPackagesAsync=async ()=>{
+
+    if(buildPackagesLoaded){
+        return;
+    }
+    buildPackagesLoaded=true;
 
     rootBuildPackageJson=await loadJsonAsync('./package.json');
     rootTsConfig=await loadJsonOrDefaultAsync('./tsconfig.base.json');
@@ -1458,6 +1561,62 @@ const loadBuildPackagesAsync=async ()=>{
     }));
 
     await Promise.all(buildPkgs.map(pkg=>populatePkgPass2Async(pkg,rootBuildPackageJson,rootTsConfig)));
+}
+
+const listDepsAsync=async ()=>{
+
+    await loadBuildPackagesAsync();
+    const all=[];
+    for(const pkg of buildPkgs){
+        console.log(`---------------------------------------`);
+        console.log(`${pkg.dir} (${pkg.deps.length} / ${pkg.externalDeps.length})`);
+        console.log('Internal:');
+        for(const dep of pkg.deps){
+            console.log(dep);
+            if(!all.includes(dep)){
+                all.push(dep);
+            }
+        }
+        console.log('External:');
+        for(const dep of pkg.externalDeps){
+            console.log(dep);
+            if(!all.includes(dep)){
+                all.push(dep);
+            }
+        }
+    }
+    console.log(`---------------------------------------`);
+    console.log(`All:`);
+    for(const dep of all){
+        console.log(dep);
+    }
+}
+
+const cleanProjectAsync=async ()=>{
+    const rm=async (path)=>{
+        console.log(`${dryRun?'dry run> ':''}rm -rf '${path}'`);
+        if(!dryRun){
+            await fs.rm(path,{recursive:true,force:true});
+        }
+    }
+    const dirs=await fs.readdir('packages');
+    await Promise.all([
+        rm('.pkij'),
+        rm('.next'),
+        rm('dist'),
+        ...dirs.map(async d=>{
+            const dir=Path.join('packages',d);
+            const nextDir=Path.join(dir,'.next');
+            const cdkDir=Path.join(dir,'cdk.out');
+            if(await existsAsync(nextDir)){
+                await rm(nextDir);
+            }
+            if(await existsAsync(cdkDir)){
+                await rm(cdkDir);
+            }
+        })
+
+    ])
 }
 
 const buildAsync=async ()=>{
@@ -1478,8 +1637,6 @@ const buildAsync=async ()=>{
         }else{
             await spawnAsync({
                 cmd:buildCmd,
-                stderr:console.error,
-                stdout:console.log
             });
         }
     }
@@ -1554,7 +1711,7 @@ const findDeps=(content,reg,matchI,deps,externalDeps,rootBuildPackageJson,rootTs
             if(!invalidImportReg.test(name)){
                 if(isProjectDep(name,rootBuildPackageJson,rootTsConfig)){
                     deps.push(name);
-                }else{
+                }else if(!externalDeps.includes(name)){
                     externalDeps.push(name);
                 }
             }
@@ -1599,6 +1756,10 @@ const buildPackageAsync=async (pkg)=>{
         return;
     }
 
+    if(verbose){
+        console.log('Build Package',pkg);
+    }
+
     const {outBaseDir,outDir}=getPkgOut(pkg);
 
     if(buildIndividualPackages && (pkg.config?.type??'lib')==='lib'){
@@ -1609,7 +1770,7 @@ const buildPackageAsync=async (pkg)=>{
         await buildBinAsync(pkg,outBaseDir,outDir);
     }
 
-    const packageJson={...pkg.packageJson}
+    const packageJson=pkg.packageJson;
     const [outExists,srcExists,indexExists]=await Promise.all([
         existsAsync(outDir),
         existsAsync(Path.join(outDir,'src')),
@@ -1617,6 +1778,9 @@ const buildPackageAsync=async (pkg)=>{
     ])
     if(!packageJson.main && indexExists){
         packageJson.main='./src/index.js';
+    }
+    if(packageJson.sideEffects===undefined){
+        packageJson.sideEffects=false;
     }
 
     if(!dryRun && outExists){
@@ -1653,7 +1817,7 @@ const buildLibAsync=async (pkg,outBaseDir,outDir)=>{
     await buildEsPackageAsync(pkg);
 }
 
-const nodeExternals=['path','fs','events','readline','http','os','stream','child_Process','inspector']
+const nodeExternals=['path','fs','events','readline','http','os','stream','child_Process','inspector','fsevents']
 
 /**
  * Builds a package as an executable
@@ -1674,26 +1838,32 @@ const buildBinAsync=async (pkg,outBaseDir,outDir)=>{
     if(!files.length){
         return;
     }
+    
+    const outDirRel=Path.join(outBaseDir,pkg.dir,'bin');
+    if(!dryRun){
+        await fs.rm(outDirRel,{recursive:true,force:true});
+        await fs.mkdir(outDirRel,{recursive:true});
+    }
 
-    const outdir=await fs.realpath(Path.join(outBaseDir,pkg.binDir))
+    const outdir=await fs.realpath(outDirRel);
     const config={
         outdir,
         bundle:true,
         platform:"node",
         target:"node20",
-        minify:true,
+        minify:false,
+        format:'cjs',
         "banner:js":"#!/usr/bin/env node",
         sourcemap:"external",
         external:['node:*',...nodeExternals,...(pkg.externalDeps??[])],
         'tree-shaking':true,
         ...pkg.binBuildOptions,
     }
+
     const configDir=Path.join('.pkij',pkg.dir);
     const configPath=Path.join(configDir,'esbuild-config.json');
 
     if(!dryRun){
-        await fs.rm(outdir,{recursive:true,force:true});
-        await fs.mkdir(outdir,{recursive:true});
         await fs.mkdir(configDir,{recursive:true});
         await fs.writeFile(configPath,JSON.stringify(config,null,4));
     }
@@ -1707,9 +1877,16 @@ const buildBinAsync=async (pkg,outBaseDir,outDir)=>{
             await spawnAsync({
                 cwd:pkg.dir,
                 cmd,
-                stderr:console.error,
-                stdout:console.log
-            })
+            });
+            if(!pkg.packageJson.bin){
+                pkg.packageJson.bin={}
+                const files=await fs.readdir(outdir);
+                for(const f of files){
+                    if(f.endsWith('.js')){
+                        pkg.packageJson.bin[f.substring(0,f.length-3)]=`bin/${f}`;
+                    }
+                }
+            }
         }
 
         console.log(`${pkg.dir} complete - ${(Date.now()-start).toLocaleString()}ms`)
@@ -1761,8 +1938,6 @@ const buildEsPackageAsync=async (pkg)=>{
             await spawnAsync({
                 cwd:pkg.dir,
                 cmd,
-                stderr:console.error,
-                stdout:console.log
             })
         }
 
@@ -1883,8 +2058,14 @@ const showUsage=()=>{
 
 --migrate-nx-tsconfig           Migrates tsconfig files used in NX projects
 
+--update-tsconfig               Updates all tsconfig references and other mono-repo properties
+
+--list-deps                     Lists dependencies
+
 --publish       [path ...]      Publishes the specified packages or all packages in the package directory
                                 that are in the npm namespace or publish list if no packages are specified
+
+--publish-no-build              Disables automatic building before publishing
 
 --set-version  [version]        Sets the version of all package.json files. If no version is supplied the all versions are increased by 0.0.1.
 
@@ -1918,6 +2099,10 @@ const showUsage=()=>{
 
 --ignore        [path ...]      A list of paths to ignore. The ignored paths will not be linked when
                                 injecting packages
+
+--clean                         Clears the dist, .pkij and all .next directories
+
+--yes                           Answers yes for all interactive prompts 
 
 --verbose                       If present verbose logging will be enabled.`)
 }
