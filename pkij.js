@@ -78,6 +78,7 @@ let listDeps=false;
 let yes=false;
 let publishNoBuild=false;
 let cleanProject=false;
+let runTests=undefined;
 
 
 const main=async ()=>{
@@ -225,6 +226,12 @@ const main=async ()=>{
                 hasAction=true;
                 break;
 
+            case '--test':
+                runTests=nextAll.length?nextAll:true;
+                hasAction=true;
+                updateTsConfigs=true;
+                break;
+
             case '--migrate-nx-tsconfig':
                 migrateNxTsConfig=true;
                 hasAction=true;
@@ -345,6 +352,10 @@ const main=async ()=>{
 
     if(migrateNxTsConfig){
         await migrateNxTsConfigAsync();
+    }
+
+    if(runTests){
+        await runTestsAsync(runTests);
     }
 
     if(setVersion){
@@ -1215,11 +1226,14 @@ const ejectAsync=async (pkg)=>{
 
 /**
  * 
- * @param {string} npmName 
+ * @param {string|null|undefined} npmName 
  * @param {Config} config 
  * @returns 
  */
 const isInPublishScope=(npmName,config)=>{
+    if(!npmName){
+        return false;
+    }
     const ns=config.namespace?config.namespace+'/':'//';
     return (
         config.excludeNamespaceFromBuildList?
@@ -1341,6 +1355,67 @@ const publishPackagesAsync=async (publishNames)=>{
             }
         }
     }
+}
+
+/**
+ * @param {string[]|true} tests 
+ */
+const runTestsAsync=async (tests)=>{
+    await loadBuildPackagesAsync();
+    /** @type {Pkg[]|undefined} */
+    let packages;
+    if(tests===true){
+        packages=await getScopePackagesAsync();
+    }else{
+        packages=buildPkgs.filter(p=>tests.includes(p.dir));
+    }
+
+    const outBaseDir='./.pkij/tests';
+
+    if(!dryRun){
+        await fs.rm(outBaseDir,{recursive:true,force:true});
+    }
+
+    await Promise.all(packages.map(p=>buildTestAsync(p,outBaseDir)));
+
+    await spawnAsync({
+        cmd:`npx jest --rootDir '${outBaseDir}'`
+    });
+
+}
+
+/**
+ * @param {Pkg} pkg 
+ * @param {string} outBaseDir
+ */
+const buildTestAsync=async (pkg,outBaseDir)=>{
+    const outdir=Path.join(outBaseDir,pkg.dir);
+    const files=[];
+    await scanDirAsync(pkg.dir,outdir,(file,srcPath)=>{
+        if(file.endsWith('.test.ts') || file.endsWith('.spec.ts')){
+            files.push(srcPath);
+        }
+    });
+    if(!files.length){
+        console.log(`No test found for ${pkg.dir}`);
+        return;
+    }
+    console.log(`Test files for ${pkg.dir}`,files);
+    await fs.mkdir(outdir,{recursive:true});
+    await esbuildAsync({
+        pkg,
+        outdir,
+        files,
+    })
+}
+
+/**
+ * @return {Promise<Pkg[]>} 
+ */
+const getScopePackagesAsync=async ()=>{
+    await loadBuildPackagesAsync();
+    const config=await loadJsonOrDefaultAsync(pkijConfigFileName,{});
+    return buildPkgs.filter(p=>isInPublishScope(p.npmName,config));
 }
 
 /**
@@ -1763,11 +1838,11 @@ const buildPackageAsync=async (pkg)=>{
     const {outBaseDir,outDir}=getPkgOut(pkg);
 
     if(buildIndividualPackages && (pkg.config?.type??'lib')==='lib'){
-        await buildLibAsync(pkg,outBaseDir,outDir);
+        await buildLibAsync(pkg);
     }
 
     if(pkg.binDir){
-        await buildBinAsync(pkg,outBaseDir,outDir);
+        await buildBinAsync(pkg);
     }
 
     const packageJson=pkg.packageJson;
@@ -1804,10 +1879,8 @@ const copyAsync=async (src,dest)=>{
 /**
  * Builds a package as a library
  * @param {Pkg} pkg
- * @param {string} outBaseDir
- * @param {string} outDir
  */
-const buildLibAsync=async (pkg,outBaseDir,outDir)=>{
+const buildLibAsync=async (pkg)=>{
 
     const tsConfig=pkg.tsConfig;
     if(!tsConfig || !pkg.tsConfigPath){
@@ -1818,14 +1891,22 @@ const buildLibAsync=async (pkg,outBaseDir,outDir)=>{
 }
 
 const nodeExternals=['path','fs','events','readline','http','os','stream','child_Process','inspector','fsevents']
+const esBuildConfigBase={
+    bundle:true,
+    platform:"node",
+    target:"node20",
+    minify:false,
+    format:'cjs',
+    sourcemap:"external",
+    external:['node:*',...nodeExternals],
+    'tree-shaking':true,
+}
 
 /**
  * Builds a package as an executable
  * @param {Pkg} pkg
- * @param {string} outBaseDir
- * @param {string} outDir
  */
-const buildBinAsync=async (pkg,outBaseDir,outDir)=>{
+const buildBinAsync=async (pkg)=>{
     if(!pkg.tsConfigPath || !pkg.binDir){
         return;
     }
@@ -1838,34 +1919,46 @@ const buildBinAsync=async (pkg,outBaseDir,outDir)=>{
     if(!files.length){
         return;
     }
+
+    const {outBaseDir}=getPkgOut(pkg);
     
-    const outDirRel=Path.join(outBaseDir,pkg.dir,'bin');
-    if(!dryRun){
-        await fs.rm(outDirRel,{recursive:true,force:true});
-        await fs.mkdir(outDirRel,{recursive:true});
+    await esbuildAsync({
+        pkg,
+        outdir:Path.join(outBaseDir,pkg.dir,'bin'),
+        clearOut:true,
+        files,
+        addBinsToPackageJson:true,
+        esBuildOptions:{"banner:js":"#!/usr/bin/env node",...pkg.binBuildOptions}
+    });
+}
+
+/**
+ * @typedef EsBuildOptions
+ * @prop {Pkg} pkg
+ * @prop {string} outdir
+ * @prop {boolean|undefined} clearOut
+ * @prop {string[]} files
+ * @prop {boolean|undefined} addBinsToPackageJson
+ * @prop {Record<string,any>|undefined} esBuildOptions
+ */
+
+/**
+ * 
+ * @param {EsBuildOptions} param0 
+ */
+const esbuildAsync=async ({pkg,outdir,clearOut,files,addBinsToPackageJson,esBuildOptions})=>{
+
+    if(!dryRun && clearOut){
+        await fs.rm(outdir,{recursive:true,force:true});
+        await fs.mkdir(outdir,{recursive:true});
     }
 
-    const outdir=await fs.realpath(outDirRel);
+    outdir=await fs.realpath(outdir);
     const config={
+        ...esBuildConfigBase,
         outdir,
-        bundle:true,
-        platform:"node",
-        target:"node20",
-        minify:false,
-        format:'cjs',
-        "banner:js":"#!/usr/bin/env node",
-        sourcemap:"external",
-        external:['node:*',...nodeExternals,...(pkg.externalDeps??[])],
-        'tree-shaking':true,
-        ...pkg.binBuildOptions,
-    }
-
-    const configDir=Path.join('.pkij',pkg.dir);
-    const configPath=Path.join(configDir,'esbuild-config.json');
-
-    if(!dryRun){
-        await fs.mkdir(configDir,{recursive:true});
-        await fs.writeFile(configPath,JSON.stringify(config,null,4));
+        external:[...esBuildConfigBase.external,...(pkg.externalDeps??[])],
+        ...esBuildOptions,
     }
 
     try{
@@ -1878,7 +1971,7 @@ const buildBinAsync=async (pkg,outBaseDir,outDir)=>{
                 cwd:pkg.dir,
                 cmd,
             });
-            if(!pkg.packageJson.bin){
+            if(addBinsToPackageJson && !pkg.packageJson.bin){
                 pkg.packageJson.bin={}
                 const files=await fs.readdir(outdir);
                 for(const f of files){
@@ -2061,6 +2154,9 @@ const showUsage=()=>{
 --update-tsconfig               Updates all tsconfig references and other mono-repo properties
 
 --list-deps                     Lists dependencies
+
+--test          [path ...]      Tests the specified packages or all packages in the package directory
+                                that are in the npm namespace or publish list if no packages are specified
 
 --publish       [path ...]      Publishes the specified packages or all packages in the package directory
                                 that are in the npm namespace or publish list if no packages are specified
