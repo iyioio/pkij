@@ -21,6 +21,7 @@ const readline = require('readline');
  * @prop {Record<string,any>} packageJson Package json
  * @prop {Record<string,any>} tsConfig tsconfig json
  * @prop {string|undefined} tsConfigPath Path to tsconfig file relative to root of project
+ * @prop {Record<string,string>} scripts Direct package dependencies
  * @prop {string[]} deps Direct package dependencies
  * @prop {string[]} externalDeps external deps
  * @prop {string[]|undefined} assets markdown files and images
@@ -42,6 +43,10 @@ const readline = require('readline');
  *
  * @typedef BuildConfig
  * @prop {boolean|undefined} disabled
+ *
+ * @typedef ScriptTarget
+ * @prop {string} name
+ * @prop {string} dir
  */
 
 const pkijConfigFileName='.pkij.json'
@@ -79,7 +84,10 @@ let yes=false;
 let publishNoBuild=false;
 let cleanProject=false;
 let runTests=undefined;
+let minOutput=false;
 const loadEnvs=['.env','.env.local','.env.secrets','.env.local-secrets'];
+/** @type {ScriptTarget[]} */
+const scriptTargets=[];
 
 
 const main=async ()=>{
@@ -140,7 +148,8 @@ const main=async ()=>{
 
         const next=nextAll[0]??'';
 
-        switch(process.argv[i]){
+        const currentArg=process.argv[i]
+        switch(currentArg){
 
             case '--inject':
                 hasAction=true;
@@ -243,6 +252,20 @@ const main=async ()=>{
                 updateTsConfigs=true;
                 break;
 
+            case '--run':
+                hasAction=true;
+                minOutput=true;
+                for(const t of nextAll){
+                    const i=t.indexOf(':');
+                    if(i===-1){
+                        scriptTargets.push({name:t,dir:'.'})
+                    }else{
+                        const p=t.substring(0,i);
+                        scriptTargets.push({name:t.substring(i+1),dir:(p.includes('/') || p.includes('\\'))?p:`packages/${p}`})
+                    }
+                }
+                break;
+
             case '--migrate-nx-tsconfig':
                 migrateNxTsConfig=true;
                 hasAction=true;
@@ -311,7 +334,17 @@ const main=async ()=>{
                 showUsage();
                 process.exit(0);
 
+            default:
+                if(currentArg.startsWith('--')){
+                    throw new Error(`Unknown argument: ${currentArg}`);
+                }
+                break;
+
         }
+    }
+
+    if(verbose){
+        minOutput=false;
     }
 
     if(!hasAction){
@@ -319,17 +352,19 @@ const main=async ()=>{
         process.exit(1);
     }
 
-    console.info('pkij config',{
-        dryRun,
-        verbose,
-        packageJsonFile,
-        gitIgnoreFile,
-        tsConfigFile,
-        ignoreList,
-        skipNpmInstall,
-        buildPaths,
-        loadEnvs,
-    });
+    if(!minOutput){
+        console.info('pkij config',{
+            dryRun,
+            verbose,
+            packageJsonFile,
+            gitIgnoreFile,
+            tsConfigFile,
+            ignoreList,
+            skipNpmInstall,
+            buildPaths,
+            loadEnvs,
+        });
+    }
 
     for(const env of loadEnvs){
         await loadEnvAsync(env);
@@ -393,7 +428,74 @@ const main=async ()=>{
         }
     }
 
-    console.log('pkij done');
+    if(scriptTargets.length){
+        for(const t of scriptTargets){
+            await runScriptAsync(t);
+        }
+    }
+
+    if(!minOutput){
+        console.log('pkij done');
+    }
+}
+
+/**
+ * @param {ScriptTarget} target 
+ */
+const runScriptAsync=async (target)=>{
+
+    const tryRunObjScriptAsync=async (filePath)=>{
+        const obj=await loadJsonOrDefaultAsync(filePath,null);
+        let script=obj?.scripts?.[target.name];
+        if(script){
+            if(verbose){
+                console.log(`run ${filePath}{.scripts[${target.name}]}`)
+            }
+            await spawnAsync({
+                dryRun,
+                cmd:script,
+                cwd:target.dir,
+                exitWithErrorCode:true,
+            });
+            return true;
+        }else{
+            return false;
+        }
+    }
+
+    const tryRunShellFileAsync=async (filePath)=>{
+        if(!await existsAsync(filePath)){
+            return false;
+        }
+        if(verbose){
+            console.log(`run ${filePath}`)
+        }
+        await spawnAsync({
+            dryRun,
+            cmd:`./${Path.basename(filePath)}`,
+            cwd:Path.dirname(filePath),
+            exitWithErrorCode:true,
+        });
+        return true;
+    }
+
+    if(await tryRunObjScriptAsync(Path.join(target.dir,pkijConfigFileName))){
+        return;
+    }
+
+    if(await tryRunObjScriptAsync(Path.join(target.dir,'package.json'))){
+        return;
+    }
+    
+    if(await tryRunShellFileAsync(Path.join(target.dir,`${target.name}.sh`))){
+        return;
+    }
+    
+    if(await tryRunShellFileAsync(Path.join(target.dir,'scripts',`${target.name}.sh`))){
+        return;
+    }
+
+    throw new Error(`No script found by target - ${target.dir}:${target.name}`);
 }
 
 /**
@@ -512,6 +614,8 @@ const execAsync=(
  * @prop {((code:number)=>void)|undefined} onExit
  * @prop {CancelToken|undefined} cancel
  * @prop {boolean|undefined} logPid
+ * @prop {boolean|undefined} dryRun
+ * @prop {boolean|undefined} exitWithErrorCode
  */
 
 
@@ -528,17 +632,24 @@ const spawnAsync=(
         cwd,
         out,
         silent,
-        stdout=console.log,
+        stdout=(...args)=>minOutput?process.stdout.write(args.join('')):console.log(...args),
         stderr=console.error,
         onChild,
         onOutput,
         onError,
         outPrefix='',
         throwOnError=true,
+        exitWithErrorCode=false,
         onExit,
         cancel,
         logPid,
+        dryRun,
     }=options;
+
+    if(dryRun){
+        console.log(`[dry_run] ${cwd||'.'}> ${cmd}`);
+        return Promise.resolve('');
+    }
 
     return new Promise((r,j)=>{
 
@@ -553,7 +664,7 @@ const spawnAsync=(
                 }
                 out?.(`pid(${child.pid}) > `+cmd)
             }else{
-                if(!silent){
+                if(!silent && !minOutput){
                     stdout?.('> '+cmd);
                 }
                 out?.('> '+cmd)
@@ -579,7 +690,9 @@ const spawnAsync=(
                 out?.(`pid(${child?.pid}) > # exit(${code}) -- `+cmd)
             }
             onExit?.(code??0);
-            if(code && throwOnError){
+            if(code && exitWithErrorCode){
+                process.exit(code);
+            }else if(code && throwOnError){
                 j(code);
             }else{
                 r(outData.join());
@@ -2252,6 +2365,18 @@ const showUsage=()=>{
 
 --ignore        [path ...]      A list of paths to ignore. The ignored paths will not be linked when
                                 injecting packages
+
+--run        [[pkg]:name ...]   Runs a script by name. If a pkg is supplied the script will be searched
+                                for in the packages directory. If pkg does not contain a slash a
+                                path of "packages/{pkg}" will be used. If pkg is not supplied the
+                                root of the project is used as the package directory
+
+                                Scripts will be search for in the following order in the packages directory:
+                                1. Inside the scripts object of a .pkij file
+                                2. Inside the scripts object of a package.json and will be executed
+                                   using npm run {name}
+                                3. A shell file named {name}.sh
+                                4. A shell file named scripts/{name}.sh
 
 --env          [pathOrName ...] Path or name of .env files to load. If no period or slash is in the
                                 value is treated as a name and a file of .env.{name} or .env-{name}
