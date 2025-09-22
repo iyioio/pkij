@@ -79,6 +79,7 @@ let yes=false;
 let publishNoBuild=false;
 let cleanProject=false;
 let runTests=undefined;
+const loadEnvs=['.env','.env.local','.env.secrets','.env.local-secrets'];
 
 
 const main=async ()=>{
@@ -161,6 +162,16 @@ const main=async ()=>{
                 }else{
                     await addInjectedToAsync(eject,pkijConfigFileName);
                 }
+                break;
+
+            case '--env':
+                for(const e of nextAll){
+                    loadEnvs.push((e.includes('.') || e.includes('/') || e.includes('\\'))?e:`.env.${e}`);
+                }
+                break;
+
+            case '--clear-env':
+                loadEnvs.splice(0,loadEnvs.length);
                 break;
             
             case '--yes':
@@ -317,7 +328,12 @@ const main=async ()=>{
         ignoreList,
         skipNpmInstall,
         buildPaths,
-    })
+        loadEnvs,
+    });
+
+    for(const env of loadEnvs){
+        await loadEnvAsync(env);
+    }
 
     if(cleanProject){
         await cleanProjectAsync();
@@ -378,6 +394,47 @@ const main=async ()=>{
     }
 
     console.log('pkij done');
+}
+
+/**
+ * @param {string} path 
+ */
+const loadEnvAsync=async (path)=>{
+    const text=await loadTextOrDefaultAsync(path,'');
+    if(path.toLowerCase().endsWith('.json')){
+        const obj=JSON.parse(text);
+        for(const e in obj){
+            const v=obj[e];
+            if(v===null || v===undefined){
+                continue;
+            }
+            if(verbose){
+                console.log(`env ${path}:${e}`);
+            }
+            if(typeof v === 'object'){
+                process.env[e]=JSON.stringify(v);
+            }else{
+                process.env[e]=v+'';
+            }
+        }
+    }else{
+        const lines=text.split('\n').map(l=>l.trim());
+        for(const line of lines){
+            if(!line || line.startsWith('#')){
+                continue;
+            }
+            const i=line.indexOf('=');
+            if(i===-1){
+                continue;
+            }
+            const name=line.substring(0,i).trim();
+            const value=line.substring(i+1).trim();
+            if(verbose){
+                console.log(`env ${path}:${name}`);
+            }
+            process.env[name]=value;
+        }
+    }
 }
 
 /**
@@ -2195,6 +2252,16 @@ const showUsage=()=>{
 
 --ignore        [path ...]      A list of paths to ignore. The ignored paths will not be linked when
                                 injecting packages
+
+--env          [pathOrName ...] Path or name of .env files to load. If no period or slash is in the
+                                value is treated as a name and a file of .env.{name} or .env-{name}
+                                will be searched for in the current directory.
+                                By default .env, .env.local, .env.secrets and .env.local-secrets are
+                                loaded.
+
+--clear-env                     Clears all loaded env files including defaults. (note) The position
+                                of this argument is important and only clears envs loaded before
+                                the positions of this argument.
 
 --clean                         Clears the dist, .pkij and all .next directories
 
