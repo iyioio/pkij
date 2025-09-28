@@ -7,6 +7,18 @@ const Path = require("node:path");
 const readline = require('readline');
 
 /**
+ * @typedef Config
+ * @prop {'lib'|'nextjs'|'cdk'|'test'|'repo'|undefined} type
+ * @prop {Pkg[]|undefined} inject Packages to inject
+ * @prop {string[]|undefined} ignore
+ * @prop {BuildConfig|undefined} build
+ * @prop {boolean|undefined} disabled
+ * @prop {Record<string,any>} binBuildOptions ESBuild options used for building bin executables
+ * @prop {string|undefined} namespace NPM namespace
+ * @prop {string[]|undefined} additionalNamespaces Additional npm namespaces
+ * @prop {string[]|undefined} publishList List of packages to publish in addition to packages with the same namespace as the namespace prop
+ * @prop {boolean|undefined} excludeNamespaceFromBuildList If true packages with the same namespace as the namespace prop will not be automatically included in the publishList
+ *
  * @typedef Pkg
  * @prop {string} dir The location of the package
  * @prop {string|undefined} npmName Name of the package as defined in the package's package.json file
@@ -28,18 +40,6 @@ const readline = require('readline');
  * @prop {Config|undefined} config additional configuration
  * @prop {string|undefined} binDir A directory where bin commands should be compiled from
  * @prop {boolean|undefined} disablePublish Disables NPM publishing
- *
- * @typedef Config
- * @prop {'lib'|'nextjs'|'cdk'|'test'|'repo'|undefined} type
- * @prop {Pkg[]|undefined} inject Packages to inject
- * @prop {string[]|undefined} ignore
- * @prop {BuildConfig|undefined} build
- * @prop {boolean|undefined} disabled
- * @prop {Record<string,any>} binBuildOptions ESBuild options used for building bin executables
- * @prop {string|undefined} namespace NPM namespace
- * @prop {string[]|undefined} additionalNamespaces Additional npm namespaces
- * @prop {string[]|undefined} publishList List of packages to publish in addition to packages with the same namespace as the namespace prop
- * @prop {boolean|undefined} excludeNamespaceFromBuildList If true packages with the same namespace as the namespace prop will not be automatically included in the publishList
  *
  * @typedef BuildConfig
  * @prop {boolean|undefined} disabled
