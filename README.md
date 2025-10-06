@@ -97,6 +97,8 @@ npm install -g @iyio/pkij
                                 By default .env, .env.local, .env.secrets and .env.local-secrets are
                                 loaded.
 
+--disable-branch-env            Disables loading .env.branch-{current git branch}
+
 --clear-env                     Clears all loaded env files including defaults. (note) The position
                                 of this argument is important and only clears envs loaded before
                                 the positions of this argument.
