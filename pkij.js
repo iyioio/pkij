@@ -85,10 +85,12 @@ let publishNoBuild=false;
 let cleanProject=false;
 let runTests=undefined;
 let minOutput=false;
-const loadEnvs=['.env','.env.local','.env.secrets','.env.local-secrets'];
+let disableBranchEnv=false;
+const branchEnvInsert='//branch'
+const branchLocalEnvInsert='//branch-local'
+const loadEnvs=['.env','.env.secrets',branchEnvInsert,'.env.local','.env.local-secrets',branchLocalEnvInsert];
 /** @type {ScriptTarget[]} */
 const scriptTargets=[];
-
 
 const main=async ()=>{
 
@@ -103,6 +105,8 @@ const main=async ()=>{
     * @type {Record<string,Pkg>}
     */
     const eject={};
+
+    let clearEnv=false;
 
     const addInjectedToAsync=async (dic,path)=>{
         /** @type {Pkg[]} */
@@ -180,6 +184,7 @@ const main=async ()=>{
                 break;
 
             case '--clear-env':
+                clearEnv=true;
                 loadEnvs.splice(0,loadEnvs.length);
                 break;
             
@@ -227,6 +232,10 @@ const main=async ()=>{
             case '--update-tsconfig':
                 updateTsConfigs=true;
                 hasAction=true;
+                break;
+
+            case '--disable-branch-env':
+                disableBranchEnv=true;
                 break;
 
             case '--update-imports':
@@ -347,9 +356,25 @@ const main=async ()=>{
         minOutput=false;
     }
 
-    if(!hasAction){
-        showUsage();
-        process.exit(1);
+    if(!disableBranchEnv && !clearEnv){
+        const branch=await getGitBranchAsync();
+        if(branch===null){
+            process.exit(1);
+        }
+        let i=loadEnvs.indexOf(branchEnvInsert);
+        const name=branch.replace(/[^\w-]/g,'_');
+        loadEnvs.splice(i===-1?0:i,1,`.env.branch-${name}`);
+        i=loadEnvs.indexOf(branchLocalEnvInsert);
+        loadEnvs.splice(i===-1?0:i,1,`.env.local-branch-${name}`);
+    }else{
+        let i=loadEnvs.indexOf(branchEnvInsert);
+        if(i!==-1){
+            loadEnvs.splice(i,1);
+        }
+        i=loadEnvs.indexOf(branchLocalEnvInsert);
+        if(i!==-1){
+            loadEnvs.splice(i,1);
+        }
     }
 
     if(!minOutput){
@@ -366,6 +391,12 @@ const main=async ()=>{
         });
     }
 
+    if(!hasAction){
+        showUsage();
+        process.exit(1);
+    }
+
+    
     for(const env of loadEnvs){
         await loadEnvAsync(env);
     }
@@ -436,6 +467,23 @@ const main=async ()=>{
 
     if(!minOutput){
         console.log('pkij done');
+    }
+}
+
+const getGitBranchAsync=async ()=>{
+    if(await existsAsync('.git')){
+        try{
+            return (await spawnAsync({
+                cmd:'git rev-parse --abbrev-ref HEAD',
+                silent:true,
+                throwOnError:true,
+            }))?.trim()??'main';
+        }catch(ex){
+            console.error('Unable to determine branch in current repo')
+            return null;
+        }
+    }else{
+        return 'main';
     }
 }
 
@@ -2383,6 +2431,8 @@ const showUsage=()=>{
                                 will be searched for in the current directory.
                                 By default .env, .env.local, .env.secrets and .env.local-secrets are
                                 loaded.
+
+--disable-branch-env            Disables loading .env.branch-{current git branch}
 
 --clear-env                     Clears all loaded env files including defaults. (note) The position
                                 of this argument is important and only clears envs loaded before
