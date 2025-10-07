@@ -49,7 +49,7 @@ const readline = require('readline');
  * @prop {string} dir
  */
 
-const pkijConfigFileName='.pkij.json'
+const pkijConfigFileName='pkij.json'
 
 const mergePkgProps=['isNpmDevDep','installedNpmVersion'];
 
@@ -2355,11 +2355,11 @@ const showUsage=()=>{
     console.log(`Usage:
     
 --inject        [path ...]      List of package source config files or paths to package directories to inject.
-                                If no paths are provided a default value of ".pkij.json" is used.
+                                If no paths are provided a default value of "pkij.json" is used.
 
 
 --eject         [path ...]      List of package source config files or paths to package directories to eject.
-                                If no paths are provided a default value of ".pkij.json" is used.
+                                If no paths are provided a default value of "pkij.json" is used.
 
 --build         [path ...]      Builds packages. If no packages are specified all packages are built.
 --build-peer-internal-only      If present only internal packages ( packages in the packages directory) will be peers
