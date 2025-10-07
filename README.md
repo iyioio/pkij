@@ -1,6 +1,4 @@
 # pkij
-A single file 0 dependency CLI tool for managing mono repos.
-
 A single-file, zero-dependency CLI tool designed for managing monorepos. Pkij is distributed as a standalone JavaScript file, and has no direct dependencies.
 
 With pkij, you can build, test, and publish NPM packages within a monorepo, as well as manage inter package dependencies and tsconfig and package.json references, and handle environment files. Its flexible CLI supports a wide range of arguments for customizing package management, linking strategies, and build processes, all without relying on external libraries or frameworks.
