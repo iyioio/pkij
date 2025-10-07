@@ -1,7 +1,7 @@
 {
-  "name": "@iyio/pkij",
+  "name": "pkij",
   "version": "2.0.1",
-  "description": "A CLI tool for injecting packages into a mono repo. Pkij allows you to inject packages located outside of the root of a mono repo while keeping file in sync with the source location. This is very useful when developing library packages as it allows you to keep the code for library packages in a separate git repo while you test the package in other repos without the need to continuously publish NPM updates.",
+  "description": "A single-file, zero-dependency CLI tool designed for managing monorepos. Pkij is distributed as a standalone JavaScript file, and has no direct dependencies.",
   "main": "pkij.js",
   "scripts": {
     "publish-package": "npm publish --access public --tag latest"
