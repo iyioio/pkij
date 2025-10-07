@@ -1,6 +1,6 @@
 {
   "name": "pkij",
-  "version": "2.0.1",
+  "version": "2.1.0",
   "description": "A single-file, zero-dependency CLI tool designed for managing monorepos. Pkij is distributed as a standalone JavaScript file, and has no direct dependencies.",
   "main": "pkij.js",
   "scripts": {
